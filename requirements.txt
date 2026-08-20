@@ -1,0 +1,9 @@
+torch>=2.2
+datasets>=2.19
+transformers==5.15.1
+tokenizers>=0.19
+PyYAML>=6.0
+numpy>=1.26
+tqdm>=4.66
+huggingface_hub>=0.34
+pytest>=8.0

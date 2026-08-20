@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "looped-transformer-baseline"
+version = "0.1.0"
+description = "A looped baseline built on Hugging Face Qwen3 for FineWeb"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.2",
+  "datasets>=2.19",
+  "transformers==5.15.1",
+  "tokenizers>=0.19",
+  "PyYAML>=6.0",
+  "numpy>=1.26",
+  "tqdm>=4.66",
+  "huggingface_hub>=0.34",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
