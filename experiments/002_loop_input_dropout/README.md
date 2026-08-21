@@ -41,12 +41,10 @@ python experiments/002_loop_input_dropout/run.py --variant dropout_p010_r8
 python experiments/002_loop_input_dropout/run.py --variant dropout_p020_r8
 ```
 
-Для продолжения прерванного обучения добавьте `--resume`. Только оценка существующего checkpoint запускается с `--eval-only`.
-
 После получения двух JSON соберите итоговую таблицу:
 
 ```bash
 python experiments/002_loop_input_dropout/summarize.py
 ```
 
-Checkpoints сохраняются в `outputs/experiments/002/`, а JSON и CSV — в `experiments/002_loop_input_dropout/results/`. Директорию `outputs/` не следует коммитить в GitHub.
+Checkpoints сохраняются в `outputs/experiments/002/`, а JSON и CSV — в `experiments/002_loop_input_dropout/results/`.
