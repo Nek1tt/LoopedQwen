@@ -38,6 +38,13 @@ residual stream, а накопление радиальной компонент
 Для каждого числа loops сохраняются loss, perplexity, относительное обновление,
 норма hidden state и cosine similarity с предыдущим состоянием.
 
+Tokenizer, подготовка FineWeb, обучение, validation и evaluation показывают
+прогресс и ETA через tqdm. Training bar обновляет loss, learning rate, gradient
+norm и tokens/sec. Evaluation использует взвешенный объём работы `loops × batches`,
+чтобы ранние дешёвые depth не давали заведомо заниженную оценку оставшегося
+времени. Машиночитаемые train/validation records сохраняются в
+`outputs/experiments/003/<variant>/metrics.jsonl`.
+
 ## Критерий результата
 
 Главная метрика — PPL@16 относительно `control_r16`. Признаком действительно

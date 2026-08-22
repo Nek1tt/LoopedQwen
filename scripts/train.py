@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import torch
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 from looped_lm import LoopedQwen3Config, LoopedQwen3ForCausalLM
@@ -22,16 +23,33 @@ def parse_args() -> argparse.Namespace:
 
 
 @torch.no_grad()
-def estimate_loss(model, dataset, batches, batch_size, device, amp_context, seed=1234) -> float:
+def estimate_loss(
+    model,
+    dataset,
+    batches,
+    batch_size,
+    device,
+    amp_context,
+    seed=1234,
+    description="validation",
+) -> float:
     model.eval()
     generator = torch.Generator().manual_seed(seed)
     losses = []
-    for _ in range(batches):
+    progress = tqdm(
+        range(batches),
+        desc=description,
+        unit="batch",
+        leave=False,
+        dynamic_ncols=True,
+    )
+    for _ in progress:
         x, _ = dataset.get_batch(batch_size, device, generator)
         with amp_context():
             # Hugging Face's causal-LM loss performs the one-token shift.
             loss = model(input_ids=x, labels=x, use_cache=False).loss
         losses.append(loss.float())
+        progress.set_postfix(loss=f"{torch.stack(losses).mean().item():.4f}")
     model.train()
     return torch.stack(losses).mean().item()
 
@@ -114,7 +132,24 @@ def main() -> None:
     model.train()
     started = time.time()
     session_start_tokens = tokens_seen
-    for step in range(start_step, total_steps):
+    print(
+        f"training plan: steps={total_steps:,}; start={start_step:,}; "
+        f"tokens/step={tokens_per_step:,}; total_tokens={total_steps * tokens_per_step:,}; "
+        f"effective_depth={model_cfg.num_hidden_layers * model_cfg.num_loops}; "
+        f"eval_every={train_cfg['eval_interval']} steps x {train_cfg['eval_batches']} batches",
+        flush=True,
+    )
+    progress = tqdm(
+        range(start_step, total_steps),
+        total=total_steps,
+        initial=start_step,
+        desc=f"train R={model_cfg.num_loops}",
+        unit="step",
+        dynamic_ncols=True,
+    )
+    latest_val_loss = None
+    for step in progress:
+        step_started = time.time()
         raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
         noise_multiplier = raw_model.set_loop_noise_step(step)
         optimizer.zero_grad(set_to_none=True)
@@ -144,19 +179,32 @@ def main() -> None:
         scaler.step(optimizer)
         scaler.update()
         tokens_seen = (step + 1) * tokens_per_step
+        elapsed = max(time.time() - started, 1e-6)
+        tokens_per_second = (tokens_seen - session_start_tokens) / elapsed
+        grad_norm_value = float(grad_norm)
+        postfix = {
+            "loss": f"{accumulated_loss:.4f}",
+            "lr": f"{lr:.2e}",
+            "grad": f"{grad_norm_value:.2f}",
+            "tok/s": f"{tokens_per_second:,.0f}",
+        }
+        if latest_val_loss is not None:
+            postfix["val"] = f"{latest_val_loss:.4f}"
+        progress.set_postfix(postfix)
 
         if step % train_cfg["log_interval"] == 0 or step == total_steps - 1:
-            elapsed = max(time.time() - started, 1e-6)
             record = {
                 "step": step,
                 "tokens_seen": tokens_seen,
                 "train_loss": accumulated_loss,
                 "lr": lr,
-                "grad_norm": float(grad_norm),
-                "tokens_per_second": (tokens_seen - session_start_tokens) / elapsed,
+                "grad_norm": grad_norm_value,
+                "tokens_per_second": tokens_per_second,
+                "step_seconds": time.time() - step_started,
+                "session_elapsed_seconds": elapsed,
                 "loop_noise_multiplier": noise_multiplier,
             }
-            print(json.dumps(record), flush=True)
+            tqdm.write(json.dumps(record))
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
 
@@ -169,14 +217,18 @@ def main() -> None:
                 train_cfg["micro_batch_size"],
                 device,
                 amp_context,
+                description=f"validation step {step + 1}/{total_steps}",
             )
+            latest_val_loss = val_loss
+            progress.set_postfix({**postfix, "val": f"{val_loss:.4f}"})
             record = {
                 "step": step,
                 "tokens_seen": tokens_seen,
                 "val_loss": val_loss,
                 "val_perplexity": math.exp(min(val_loss, 20)),
+                "session_elapsed_seconds": time.time() - started,
             }
-            print(json.dumps(record), flush=True)
+            tqdm.write(json.dumps(record))
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record) + "\n")
             raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -224,7 +276,12 @@ def main() -> None:
         best_val,
         config,
     )
-    print(f"finished; best validation loss={best_val:.4f}")
+    progress.close()
+    print(
+        f"finished in {(time.time() - started) / 60:.1f} min; "
+        f"best validation loss={best_val:.4f}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
