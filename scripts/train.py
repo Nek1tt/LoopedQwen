@@ -115,6 +115,8 @@ def main() -> None:
     started = time.time()
     session_start_tokens = tokens_seen
     for step in range(start_step, total_steps):
+        raw_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+        noise_multiplier = raw_model.set_loop_noise_step(step)
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
         for micro_step in range(train_cfg["gradient_accumulation_steps"]):
@@ -152,6 +154,7 @@ def main() -> None:
                 "lr": lr,
                 "grad_norm": float(grad_norm),
                 "tokens_per_second": (tokens_seen - session_start_tokens) / elapsed,
+                "loop_noise_multiplier": noise_multiplier,
             }
             print(json.dumps(record), flush=True)
             with log_path.open("a", encoding="utf-8") as f:

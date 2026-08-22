@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 from contextlib import nullcontext
+from pathlib import Path
 
 import torch
 
@@ -17,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loops", nargs="+", type=int, default=[1, 2, 4, 8, 16])
     parser.add_argument("--batches", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -35,6 +37,8 @@ def main() -> None:
         generator = torch.Generator().manual_seed(1234)
         losses = []
         update_sums = torch.zeros(loops, device=device)
+        hidden_norm_sums = torch.zeros(loops, device=device)
+        cosine_sums = torch.zeros(loops, device=device)
         for _ in range(args.batches):
             x, _ = dataset.get_batch(args.batch_size, device, generator)
             with amp():
@@ -47,17 +51,39 @@ def main() -> None:
                 )
             losses.append(output.loss.float())
             update_sums += torch.stack(model.model.last_relative_updates)
+            hidden_norm_sums += torch.stack(model.model.last_hidden_norms)
+            cosine_sums += torch.stack(model.model.last_cosine_to_previous)
         loss = torch.stack(losses).mean().item()
         result = {
             "loops": loops,
             "loss": loss,
             "perplexity": math.exp(min(loss, 20)),
             "relative_update_by_loop": (update_sums / args.batches).cpu().tolist(),
+            "hidden_norm_by_loop": (hidden_norm_sums / args.batches).cpu().tolist(),
+            "cosine_to_previous_by_loop": (cosine_sums / args.batches).cpu().tolist(),
         }
         results.append(result)
         print(json.dumps(result))
 
-    print(json.dumps({"checkpoint": args.checkpoint, "results": results}, indent=2))
+    alpha = model.model.current_loop_update_alpha().detach().float().item()
+    payload = {
+        "checkpoint": args.checkpoint,
+        "loop_update_mode": cfg.loop_update_mode,
+        "loop_update_alpha": alpha,
+        "loop_input_dropout": cfg.loop_input_dropout,
+        "loop_input_dropout_start": cfg.loop_input_dropout_start,
+        "loop_noise_std": cfg.loop_noise_std,
+        "loop_noise_mode": cfg.loop_noise_mode,
+        "loop_noise_start_loop": cfg.loop_noise_start_loop,
+        "loop_noise_warmup_steps": cfg.loop_noise_warmup_steps,
+        "loop_noise_after_last_loop": cfg.loop_noise_after_last_loop,
+        "results": results,
+    }
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Wrote evaluation to {args.output}")
+    print(json.dumps(payload, indent=2))
 
 
 if __name__ == "__main__":

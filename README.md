@@ -47,10 +47,22 @@ scripts/train.py
 scripts/eval.py
 scripts/upload_to_hub.py
 scripts/sanity_check.py
+experiments/             isolated experiment configs, runners and results
+experiments/003_loop_state_noise/  16-loop noise experiment and Colab notebook
 tests/                   small CPU tests
-COLAB.md                 copy-paste Colab workflow
 REPORT.md                experiment report template
 ```
+
+## Experiment 003: noise between recurrent passes
+
+The third experiment trains a 16-loop control and two scale-relative Gaussian
+noise variants. The main variant perturbs hidden-state direction while
+preserving each token's RMS, which isolates exploration from recurrent norm
+growth. See
+[`experiments/003_loop_state_noise/README.md`](experiments/003_loop_state_noise/README.md)
+for the hypothesis, ablations, run commands and analysis protocol. A complete
+ZIP-in / results-ZIP-out Colab workflow is provided in
+[`experiment_003_colab.ipynb`](experiments/003_loop_state_noise/experiment_003_colab.ipynb).
 
 ## Local setup
 
