@@ -21,7 +21,7 @@ $$
 Его RMS приводится к масштабу первого прохода, после чего применяется gate:
 
 $$
-\widehat\Delta_l = \Delta_l\frac{r}{\operatorname{RMS}(\Delta_l)+\varepsilon},
+\widehat\Delta_l = \Delta_l\frac{r}{\mathrm{RMS}(\Delta_l)+\varepsilon},
 \qquad \widetilde h_{l+1}=h_l+\alpha_l\widehat\Delta_l.
 $$
 
@@ -29,7 +29,7 @@ $$
 
 $$
 h_{l+1}=\widetilde h_{l+1}
-\frac{r}{\operatorname{RMS}(\widetilde h_{l+1})+\varepsilon}.
+\frac{r}{\mathrm{RMS}(\widetilde h_{l+1})+\varepsilon}.
 $$
 
 Проекция запрещает модели получать ложное уменьшение relative update только за
