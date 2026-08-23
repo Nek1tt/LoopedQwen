@@ -184,6 +184,19 @@ def main() -> None:
     final_loss_weight = float(train_cfg.get("final_loss_weight", 0.5))
     if not 0.0 < final_loss_weight <= 1.0:
         raise ValueError("training.final_loss_weight must be in (0, 1]")
+    token_loss_weighting = train_cfg.get("token_loss_weighting", "uniform")
+    if token_loss_weighting not in {"uniform", "previous_loss"}:
+        raise ValueError("training.token_loss_weighting must be uniform or previous_loss")
+    hard_token_gamma = float(train_cfg.get("hard_token_gamma", 0.5))
+    hard_token_min_weight = float(train_cfg.get("hard_token_min_weight", 0.25))
+    hard_token_max_weight = float(train_cfg.get("hard_token_max_weight", 4.0))
+    hard_token_uniform_mix = float(train_cfg.get("hard_token_uniform_mix", 0.5))
+    if hard_token_gamma <= 0.0:
+        raise ValueError("training.hard_token_gamma must be positive")
+    if not 0.0 < hard_token_min_weight <= hard_token_max_weight:
+        raise ValueError("Require 0 < hard_token_min_weight <= hard_token_max_weight")
+    if not 0.0 <= hard_token_uniform_mix <= 1.0:
+        raise ValueError("training.hard_token_uniform_mix must be in [0, 1]")
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
@@ -208,6 +221,7 @@ def main() -> None:
         f"train_depth={train_cfg.get('min_train_loops', model_cfg.num_loops)}–"
         f"{train_cfg.get('max_train_loops', model_cfg.num_loops)}; "
         f"intermediate_losses={train_cfg.get('intermediate_lm_losses', False)}; "
+        f"token_weighting={token_loss_weighting}; "
         f"validation_depths={list(validation_loops)}; "
         f"eval_every={train_cfg['eval_interval']} steps x {train_cfg['eval_batches']} batches/depth",
         flush=True,
@@ -230,6 +244,9 @@ def main() -> None:
         sampled_depths = []
         component_loss_sums = {}
         component_loss_counts = {}
+        uniform_loss_sums = {}
+        corrective_loss_sums = {}
+        hard_weight_sums = {}
         last_supervised = ()
         for micro_step in range(train_cfg["gradient_accumulation_steps"]):
             batch_index = step * train_cfg["gradient_accumulation_steps"] + micro_step
@@ -249,6 +266,11 @@ def main() -> None:
                     num_loops=sampled_depth,
                     supervision_loops=supervised_loops,
                     supervision_weights=supervision_weights,
+                    token_loss_weighting=token_loss_weighting,
+                    hard_token_gamma=hard_token_gamma,
+                    hard_token_min_weight=hard_token_min_weight,
+                    hard_token_max_weight=hard_token_max_weight,
+                    hard_token_uniform_mix=hard_token_uniform_mix,
                 )
                 loss = output.loss
                 loss = loss / train_cfg["gradient_accumulation_steps"]
@@ -257,6 +279,15 @@ def main() -> None:
             for loop, component in zip(supervised_loops, output.loop_losses):
                 component_loss_sums[loop] = component_loss_sums.get(loop, 0.0) + component.detach().float().item()
                 component_loss_counts[loop] = component_loss_counts.get(loop, 0) + 1
+            for loop, uniform, corrective, hard_weight in zip(
+                supervised_loops,
+                output.loop_uniform_losses,
+                output.loop_corrective_losses,
+                output.loop_hard_weight_means,
+            ):
+                uniform_loss_sums[loop] = uniform_loss_sums.get(loop, 0.0) + uniform.detach().float().item()
+                corrective_loss_sums[loop] = corrective_loss_sums.get(loop, 0.0) + corrective.detach().float().item()
+                hard_weight_sums[loop] = hard_weight_sums.get(loop, 0.0) + hard_weight.detach().float().item()
 
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg["grad_clip"])
@@ -285,6 +316,7 @@ def main() -> None:
             "tok/s": f"{tokens_per_second:,.0f}",
             "Rμ": f"{sum(sampled_depths) / len(sampled_depths):.1f}",
             "heads": "/".join(map(str, last_supervised)),
+            "tok-w": "hard" if token_loss_weighting == "previous_loss" else "uniform",
             "α2": f"{alpha_start:.3f}",
             "αR": f"{alpha_last:.3f}",
         }
@@ -311,6 +343,21 @@ def main() -> None:
                     str(loop): component_loss_sums[loop] / component_loss_counts[loop]
                     for loop in sorted(component_loss_sums)
                 },
+                "uniform_component_losses": {
+                    str(loop): uniform_loss_sums[loop] / component_loss_counts[loop]
+                    for loop in sorted(uniform_loss_sums)
+                },
+                "corrective_component_losses": {
+                    str(loop): corrective_loss_sums[loop] / component_loss_counts[loop]
+                    for loop in sorted(corrective_loss_sums)
+                },
+                "mean_hard_token_weights": {
+                    str(loop): hard_weight_sums[loop] / component_loss_counts[loop]
+                    for loop in sorted(hard_weight_sums)
+                },
+                "token_loss_weighting": token_loss_weighting,
+                "hard_token_gamma": hard_token_gamma,
+                "hard_token_uniform_mix": hard_token_uniform_mix,
             }
             tqdm.write(json.dumps(record))
             with log_path.open("a", encoding="utf-8") as f:

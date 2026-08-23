@@ -26,6 +26,9 @@ class LoopedCausalLMOutputWithPast(CausalLMOutputWithPast):
     """Causal-LM output with the per-depth losses used by anytime training."""
 
     loop_losses: torch.FloatTensor | None = None
+    loop_uniform_losses: torch.FloatTensor | None = None
+    loop_corrective_losses: torch.FloatTensor | None = None
+    loop_hard_weight_means: torch.FloatTensor | None = None
     supervised_loops: tuple[int, ...] | None = None
 
 
@@ -361,6 +364,41 @@ class LoopedQwen3ForCausalLM(Qwen3ForCausalLM):
     def set_loop_noise_step(self, step: int) -> float:
         return self.model.set_loop_noise_step(step)
 
+    @staticmethod
+    def _causal_token_losses(
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return shifted per-token CE and its valid-token mask."""
+        shift_logits = logits[..., :-1, :].float().contiguous()
+        shift_labels = labels[..., 1:].contiguous().to(shift_logits.device)
+        valid = shift_labels.ne(-100)
+        token_losses = torch.nn.functional.cross_entropy(
+            shift_logits.view(-1, shift_logits.shape[-1]),
+            shift_labels.view(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).view_as(shift_labels)
+        return token_losses, valid
+
+    @staticmethod
+    def _hard_token_weights(
+        previous_token_losses: torch.Tensor,
+        valid: torch.Tensor,
+        gamma: float,
+        minimum: float,
+        maximum: float,
+    ) -> torch.Tensor:
+        """Build detached, per-sequence-normalized weights from an earlier exit."""
+        valid_float = valid.to(previous_token_losses.dtype)
+        per_sequence_mean = (
+            (previous_token_losses.detach() * valid_float).sum(dim=-1, keepdim=True)
+            / valid_float.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        ).clamp_min(1.0e-8)
+        relative_difficulty = previous_token_losses.detach() / per_sequence_mean
+        weights = relative_difficulty.clamp_min(0.0).pow(gamma).clamp(minimum, maximum)
+        return torch.where(valid, weights, torch.zeros_like(weights))
+
     def forward(
         self,
         input_ids: torch.LongTensor | None = None,
@@ -375,6 +413,11 @@ class LoopedQwen3ForCausalLM(Qwen3ForCausalLM):
         return_loop_diagnostics: bool = False,
         supervision_loops: tuple[int, ...] | list[int] | None = None,
         supervision_weights: tuple[float, ...] | list[float] | None = None,
+        token_loss_weighting: str = "uniform",
+        hard_token_gamma: float = 0.5,
+        hard_token_min_weight: float = 0.25,
+        hard_token_max_weight: float = 4.0,
+        hard_token_uniform_mix: float = 0.5,
         **kwargs: Any,
     ) -> LoopedCausalLMOutputWithPast:
         # This mirrors the thin official Qwen3ForCausalLM wrapper. Custom loop
@@ -387,6 +430,18 @@ class LoopedQwen3ForCausalLM(Qwen3ForCausalLM):
             raise ValueError("supervision_loops must be sorted and unique")
         if any(loop < 1 or loop > loops for loop in supervised_loops):
             raise ValueError("supervision depths must be between 1 and num_loops")
+        if token_loss_weighting not in {"uniform", "previous_loss"}:
+            raise ValueError("token_loss_weighting must be uniform or previous_loss")
+        if hard_token_gamma <= 0.0:
+            raise ValueError("hard_token_gamma must be positive")
+        if not 0.0 < hard_token_min_weight <= hard_token_max_weight:
+            raise ValueError("hard-token clipping must satisfy 0 < min <= max")
+        if not 0.0 <= hard_token_uniform_mix <= 1.0:
+            raise ValueError("hard_token_uniform_mix must be in [0, 1]")
+        if token_loss_weighting == "previous_loss" and (
+            not isinstance(logits_to_keep, int) or logits_to_keep != 0
+        ):
+            raise ValueError("previous-loss token weighting requires full-sequence logits")
 
         outputs = self.model(
             input_ids=input_ids,
@@ -405,6 +460,9 @@ class LoopedQwen3ForCausalLM(Qwen3ForCausalLM):
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
         loop_losses = None
+        loop_uniform_losses = None
+        loop_corrective_losses = None
+        loop_hard_weight_means = None
         if labels is not None and supervised_loops:
             if supervision_weights is None:
                 weights = logits.new_full((len(supervised_loops),), 1.0 / len(supervised_loops))
@@ -419,22 +477,51 @@ class LoopedQwen3ForCausalLM(Qwen3ForCausalLM):
             captured = dict(
                 zip(self.model.last_captured_loops, self.model.last_captured_hidden_states)
             )
-            losses = []
+            depth_logits_by_loop = {}
             for loop in supervised_loops:
                 if loop == loops:
                     depth_logits = logits
                 else:
                     depth_hidden = self.model.norm(captured[loop])
                     depth_logits = self.lm_head(depth_hidden[:, slice_indices, :])
-                losses.append(
-                    self.loss_function(
-                        logits=depth_logits,
-                        labels=labels,
-                        vocab_size=self.config.vocab_size,
-                        **kwargs,
-                    )
+                depth_logits_by_loop[loop] = depth_logits
+
+            losses = []
+            uniform_losses = []
+            corrective_losses = []
+            hard_weight_means = []
+            previous_token_losses = None
+            for loop in supervised_loops:
+                token_losses, valid = self._causal_token_losses(
+                    depth_logits_by_loop[loop], labels
                 )
+                valid_float = valid.to(token_losses.dtype)
+                uniform_loss = (token_losses * valid_float).sum() / valid_float.sum().clamp_min(1.0)
+                corrective_loss = uniform_loss
+                mean_hard_weight = uniform_loss.new_ones(())
+                if token_loss_weighting == "previous_loss" and previous_token_losses is not None:
+                    hard_weights = self._hard_token_weights(
+                        previous_token_losses,
+                        valid,
+                        gamma=hard_token_gamma,
+                        minimum=hard_token_min_weight,
+                        maximum=hard_token_max_weight,
+                    )
+                    corrective_loss = (token_losses * hard_weights).sum() / hard_weights.sum().clamp_min(1.0)
+                    mean_hard_weight = hard_weights.sum() / valid_float.sum().clamp_min(1.0)
+                mixed_loss = (
+                    hard_token_uniform_mix * uniform_loss
+                    + (1.0 - hard_token_uniform_mix) * corrective_loss
+                )
+                losses.append(mixed_loss)
+                uniform_losses.append(uniform_loss)
+                corrective_losses.append(corrective_loss)
+                hard_weight_means.append(mean_hard_weight)
+                previous_token_losses = token_losses
             loop_losses = torch.stack(losses)
+            loop_uniform_losses = torch.stack(uniform_losses)
+            loop_corrective_losses = torch.stack(corrective_losses)
+            loop_hard_weight_means = torch.stack(hard_weight_means)
             loss = (loop_losses * weights).sum()
         elif labels is not None:
             loss = self.loss_function(
@@ -448,6 +535,9 @@ class LoopedQwen3ForCausalLM(Qwen3ForCausalLM):
             logits=logits,
             past_key_values=None,
             loop_losses=loop_losses,
+            loop_uniform_losses=loop_uniform_losses,
+            loop_corrective_losses=loop_corrective_losses,
+            loop_hard_weight_means=loop_hard_weight_means,
             supervised_loops=supervised_loops or None,
         )
 

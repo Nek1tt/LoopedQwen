@@ -51,6 +51,7 @@ experiments/             isolated experiment configs, runners and results
 experiments/003_loop_state_noise/  completed 16-loop noise experiment
 experiments/004_normalized_loop_updates/  projected-update experiment
 experiments/005_anytime_depth/  random-depth + intermediate-loss experiment
+experiments/006_hard_token_correction/  previous-error token weighting
 tests/                   small CPU tests
 REPORT.md                experiment report template
 ```
@@ -88,6 +89,19 @@ reference. Quality is stable across stopping depths but is not yet monotonic:
 PPL reaches its minimum near 12 loops and then slowly worsens. See
 [`experiments/005_anytime_depth/README.md`](experiments/005_anytime_depth/README.md)
 for the checkpoint-selection analysis and complete diagnostics.
+
+## Experiment 006: hard-token recurrent correction
+
+The sixth experiment asks whether later recurrent computation can be made more
+useful by weighting a token's later LM loss with its detached cross-entropy at
+the preceding supervised depth. The answer for the tested `gamma=0.5`, 50%
+uniform mixture is negative. Against the seed-42 uniform intermediate control,
+hard-token weighting improves only the out-of-range four-loop exit, while it is
+worse at every depth from 5 through 32. It leaves the best depth at 10, keeps
+the same 22 adjacent monotonicity violations, and increases PPL@32 regret from
+2.64% to 2.80%. See
+[`experiments/006_hard_token_correction/README.md`](experiments/006_hard_token_correction/README.md)
+for the objective, dense results, raw logs and interpretation.
 
 ## Local setup
 
