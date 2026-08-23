@@ -50,6 +50,7 @@ class LoopedQwen3Config(Qwen3Config):
         loop_noise_start_loop: int = 1,
         loop_noise_warmup_steps: int = 0,
         loop_noise_after_last_loop: bool = False,
+        loop_operator_schedule: str = "attention_mlp",
         **kwargs: Any,
     ) -> None:
         self.num_loops = num_loops
@@ -65,6 +66,7 @@ class LoopedQwen3Config(Qwen3Config):
         self.loop_noise_start_loop = loop_noise_start_loop
         self.loop_noise_warmup_steps = loop_noise_warmup_steps
         self.loop_noise_after_last_loop = loop_noise_after_last_loop
+        self.loop_operator_schedule = loop_operator_schedule
         super().__init__(**kwargs)
         if self.num_loops < 1:
             raise ValueError("num_loops must be positive")
@@ -100,6 +102,17 @@ class LoopedQwen3Config(Qwen3Config):
             raise ValueError("loop_noise_start_loop must be positive")
         if self.loop_noise_warmup_steps < 0:
             raise ValueError("loop_noise_warmup_steps must be non-negative")
+        valid_operator_schedules = {
+            "attention_mlp",
+            "mlp_attention",
+            "alternating_attention_mlp",
+            "alternating_mlp_attention",
+        }
+        if self.loop_operator_schedule not in valid_operator_schedules:
+            raise ValueError(
+                "loop_operator_schedule must be one of "
+                + ", ".join(sorted(valid_operator_schedules))
+            )
         if self.use_cache:
             # A standard per-layer Qwen3 KV cache is not loop-aware.
             self.use_cache = False
@@ -136,6 +149,98 @@ class LoopedQwen3Model(Qwen3Model):
         self.last_loop_update_alphas: tuple[torch.Tensor, ...] = ()
         self.last_captured_hidden_states: tuple[torch.Tensor, ...] = ()
         self.last_captured_loops: tuple[int, ...] = ()
+        self.last_operator_orders: tuple[str, ...] = ()
+        self.last_attention_relative_updates: tuple[torch.Tensor, ...] = ()
+        self.last_mlp_relative_updates: tuple[torch.Tensor, ...] = ()
+        self.last_operator_defects: tuple[torch.Tensor, ...] = ()
+        self.last_update_cosine_to_previous_update: tuple[torch.Tensor, ...] = ()
+        self.last_directional_diversity: tuple[torch.Tensor, ...] = ()
+
+    @staticmethod
+    def _operator_order(schedule: str, loop_idx: int) -> str:
+        """Resolve a schedule to the sublayer order used by one recurrent pass."""
+        if schedule == "attention_mlp":
+            return "attention_mlp"
+        if schedule == "mlp_attention":
+            return "mlp_attention"
+        if schedule == "alternating_attention_mlp":
+            return "attention_mlp" if loop_idx % 2 == 0 else "mlp_attention"
+        if schedule == "alternating_mlp_attention":
+            return "mlp_attention" if loop_idx % 2 == 0 else "attention_mlp"
+        raise ValueError(f"Unsupported loop operator schedule: {schedule}")
+
+    @staticmethod
+    def _relative_delta(delta: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        numerator = delta.float().norm(dim=-1).mean()
+        denominator = reference.float().norm(dim=-1).mean().clamp_min(1.0e-8)
+        return numerator / denominator
+
+    @staticmethod
+    def _directional_diversity(hidden_states: torch.Tensor) -> torch.Tensor:
+        directions = torch.nn.functional.normalize(hidden_states.float(), dim=-1)
+        mean_direction = directions.mean(dim=1)
+        return 1.0 - mean_direction.square().sum(dim=-1).mean()
+
+    def _apply_decoder_layer(
+        self,
+        decoder_layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        position_ids: torch.LongTensor,
+        order: str,
+        preserve_official_attention_mlp: bool = True,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply one shared Qwen3 layer and expose its two residual updates."""
+        if order == "attention_mlp":
+            if preserve_official_attention_mlp:
+                output = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_embeddings=position_embeddings,
+                    position_ids=position_ids,
+                    past_key_values=None,
+                    use_cache=False,
+                    **kwargs,
+                )
+                zero = torch.zeros_like(output)
+                return output, zero, zero
+            residual = hidden_states
+            normalized = decoder_layer.input_layernorm(hidden_states)
+            attention_output, _ = decoder_layer.self_attn(
+                hidden_states=normalized,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+            after_attention = residual + attention_output
+            mlp_output = decoder_layer.mlp(
+                decoder_layer.post_attention_layernorm(after_attention)
+            )
+            return after_attention + mlp_output, attention_output, mlp_output
+
+        if order == "mlp_attention":
+            residual = hidden_states
+            mlp_output = decoder_layer.mlp(
+                decoder_layer.post_attention_layernorm(hidden_states)
+            )
+            after_mlp = residual + mlp_output
+            attention_output, _ = decoder_layer.self_attn(
+                hidden_states=decoder_layer.input_layernorm(after_mlp),
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+            return after_mlp + attention_output, attention_output, mlp_output
+
+        raise ValueError(f"Unsupported decoder-layer order: {order}")
 
     def set_loop_noise_step(self, step: int) -> float:
         """Set the noise warmup multiplier for an optimizer step."""
@@ -215,7 +320,9 @@ class LoopedQwen3Model(Qwen3Model):
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
         num_loops: int | None = None,
+        loop_operator_schedule: str | None = None,
         return_loop_diagnostics: bool = False,
+        return_operator_diagnostics: bool = False,
         capture_hidden_at_loops: tuple[int, ...] | list[int] | None = None,
         **kwargs: Any,
     ) -> BaseModelOutputWithPast:
@@ -232,6 +339,15 @@ class LoopedQwen3Model(Qwen3Model):
         loops = self.config.num_loops if num_loops is None else num_loops
         if loops < 1:
             raise ValueError("num_loops must be positive")
+        operator_schedule = loop_operator_schedule or self.config.loop_operator_schedule
+        valid_operator_schedules = {
+            "attention_mlp",
+            "mlp_attention",
+            "alternating_attention_mlp",
+            "alternating_mlp_attention",
+        }
+        if operator_schedule not in valid_operator_schedules:
+            raise ValueError(f"Unsupported loop operator schedule: {operator_schedule}")
         capture_loops = tuple(capture_hidden_at_loops or ())
         if capture_loops != tuple(sorted(set(capture_loops))):
             raise ValueError("capture_hidden_at_loops must be sorted and unique")
@@ -264,10 +380,19 @@ class LoopedQwen3Model(Qwen3Model):
         cosine_to_previous = []
         loop_update_alphas = []
         captured_hidden_states = []
+        operator_orders = []
+        attention_relative_updates = []
+        mlp_relative_updates = []
+        operator_defects = []
+        update_cosine_to_previous_update = []
+        directional_diversity = []
         reference_rms = None
+        previous_loop_delta = None
 
         for loop_idx in range(loops):
             previous = hidden_states
+            operator_order = self._operator_order(operator_schedule, loop_idx)
+            operator_orders.append(operator_order)
             if (
                 self.training
                 and self.config.loop_input_dropout > 0.0
@@ -278,16 +403,60 @@ class LoopedQwen3Model(Qwen3Model):
                     p=self.config.loop_input_dropout,
                     training=True,
                 )
+            loop_attention_updates = []
+            loop_mlp_updates = []
+            loop_operator_defects = []
             for layer_idx, decoder_layer in enumerate(self.layers):
-                hidden_states = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask_mapping[self.config.layer_types[layer_idx]],
+                layer_input = hidden_states
+                mask = causal_mask_mapping[self.config.layer_types[layer_idx]]
+                hidden_states, attention_delta, mlp_delta = self._apply_decoder_layer(
+                    decoder_layer,
+                    layer_input,
+                    attention_mask=mask,
                     position_embeddings=position_embeddings,
                     position_ids=position_ids,
-                    past_key_values=None,
-                    use_cache=False,
+                    order=operator_order,
                     **kwargs,
                 )
+                if return_operator_diagnostics:
+                    diagnostic_actual, attention_delta, mlp_delta = (
+                        self._apply_decoder_layer(
+                            decoder_layer,
+                            layer_input,
+                            attention_mask=mask,
+                            position_embeddings=position_embeddings,
+                            position_ids=position_ids,
+                            order=operator_order,
+                            preserve_official_attention_mlp=False,
+                            **kwargs,
+                        )
+                    )
+                    alternative_order = (
+                        "mlp_attention"
+                        if operator_order == "attention_mlp"
+                        else "attention_mlp"
+                    )
+                    alternative, _, _ = self._apply_decoder_layer(
+                        decoder_layer,
+                        layer_input,
+                        attention_mask=mask,
+                        position_embeddings=position_embeddings,
+                        position_ids=position_ids,
+                        order=alternative_order,
+                        preserve_official_attention_mlp=False,
+                        **kwargs,
+                    )
+                    loop_attention_updates.append(
+                        self._relative_delta(attention_delta, layer_input).detach()
+                    )
+                    loop_mlp_updates.append(
+                        self._relative_delta(mlp_delta, layer_input).detach()
+                    )
+                    loop_operator_defects.append(
+                        self._relative_delta(
+                            diagnostic_actual - alternative, layer_input
+                        ).detach()
+                    )
 
             if self.config.loop_update_mode.startswith("normalized_projected"):
                 loop_number = loop_idx + 1
@@ -322,6 +491,23 @@ class LoopedQwen3Model(Qwen3Model):
                 ).mean()
                 cosine_to_previous.append(cosine.detach())
                 loop_update_alphas.append(alpha.detach().float())
+                loop_delta = hidden_states.float() - previous.float()
+                if previous_loop_delta is None:
+                    update_cosine = hidden_states.new_zeros((), dtype=torch.float32)
+                else:
+                    update_cosine = torch.nn.functional.cosine_similarity(
+                        loop_delta, previous_loop_delta, dim=-1
+                    ).mean()
+                update_cosine_to_previous_update.append(update_cosine.detach())
+                directional_diversity.append(
+                    self._directional_diversity(hidden_states).detach()
+                )
+                previous_loop_delta = loop_delta.detach()
+
+            if return_operator_diagnostics:
+                attention_relative_updates.append(torch.stack(loop_attention_updates).mean())
+                mlp_relative_updates.append(torch.stack(loop_mlp_updates).mean())
+                operator_defects.append(torch.stack(loop_operator_defects).mean())
 
             # Capture before optional between-loop noise. This is exactly the
             # state that would be decoded if computation stopped at this depth.
@@ -343,6 +529,14 @@ class LoopedQwen3Model(Qwen3Model):
         self.last_loop_update_alphas = tuple(loop_update_alphas)
         self.last_captured_hidden_states = tuple(captured_hidden_states)
         self.last_captured_loops = capture_loops
+        self.last_operator_orders = tuple(operator_orders)
+        self.last_attention_relative_updates = tuple(attention_relative_updates)
+        self.last_mlp_relative_updates = tuple(mlp_relative_updates)
+        self.last_operator_defects = tuple(operator_defects)
+        self.last_update_cosine_to_previous_update = tuple(
+            update_cosine_to_previous_update
+        )
+        self.last_directional_diversity = tuple(directional_diversity)
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=None)
 
@@ -410,7 +604,9 @@ class LoopedQwen3ForCausalLM(Qwen3ForCausalLM):
         use_cache: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         num_loops: int | None = None,
+        loop_operator_schedule: str | None = None,
         return_loop_diagnostics: bool = False,
+        return_operator_diagnostics: bool = False,
         supervision_loops: tuple[int, ...] | list[int] | None = None,
         supervision_weights: tuple[float, ...] | list[float] | None = None,
         token_loss_weighting: str = "uniform",
@@ -451,7 +647,9 @@ class LoopedQwen3ForCausalLM(Qwen3ForCausalLM):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             num_loops=num_loops,
+            loop_operator_schedule=loop_operator_schedule,
             return_loop_diagnostics=return_loop_diagnostics,
+            return_operator_diagnostics=return_operator_diagnostics,
             capture_hidden_at_loops=[loop for loop in supervised_loops if loop != loops],
             **kwargs,
         )

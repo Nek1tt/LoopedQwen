@@ -35,6 +35,25 @@ top of which those ideas can be tested.
 The embedding and LM-head weights are tied. The training script refuses to run
 if the model exceeds 10M parameters.
 
+## Best result
+
+The final Experiment 007 changes only the order of the two standard Qwen3
+sublayers inside every recurrent pass from Attention→MLP to MLP→Attention. It
+adds no parameters and no extra sublayer calls. Across three paired seeds it
+improves mean validation PPL over stopping depths 8–24 from 1114.20 to 949.77
+(−14.76%) and wins at all 87 evaluated seed/depth pairs.
+
+| 3-seed mean | Attention→MLP | MLP→Attention |
+|---|---:|---:|
+| Best PPL | 1108.46 | **943.95** |
+| PPL@16 | 1112.72 | **947.07** |
+| PPL@24 | 1123.97 | **961.01** |
+| PPL@32 | 1137.03 | **980.65** |
+
+The best individual checkpoint is fixed-MA seed 43 with PPL 905.82 at 11
+loops. See the Experiment 007 report for the alternating-order negative result,
+causal schedule interventions and update-direction analysis.
+
 ## Repository layout
 
 ```text
@@ -52,6 +71,7 @@ experiments/003_loop_state_noise/  completed 16-loop noise experiment
 experiments/004_normalized_loop_updates/  projected-update experiment
 experiments/005_anytime_depth/  random-depth + intermediate-loss experiment
 experiments/006_hard_token_correction/  previous-error token weighting
+experiments/007_alternating_operators/  alternating Attention/MLP order
 tests/                   small CPU tests
 REPORT.md                experiment report template
 ```
@@ -102,6 +122,18 @@ the same 22 adjacent monotonicity violations, and increases PPL@32 regret from
 2.64% to 2.80%. See
 [`experiments/006_hard_token_correction/README.md`](experiments/006_hard_token_correction/README.md)
 for the objective, dense results, raw logs and interpretation.
+
+## Experiment 007: alternating operator recurrence
+
+The seventh experiment keeps the best random-depth/intermediate-loss setup but
+changes the recurrent operator itself. Alternating Attention→MLP and
+MLP→Attention does not improve quality and produces late update cancellation.
+The fixed MLP→Attention control instead reduces mean PPL 8–24 by 10.68–19.76%
+on each of three paired seeds and is better at every evaluated depth from 4 to
+32. Schedule interventions and non-zero order defect show that the trained
+operators are not interchangeable. See
+[`experiments/007_alternating_operators/README.md`](experiments/007_alternating_operators/README.md)
+for the full hypothesis, raw results, multiseed analysis and limitations.
 
 ## Local setup
 

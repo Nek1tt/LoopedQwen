@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from types import MethodType
 
 from looped_lm import LoopedQwen3Config, LoopedQwen3ForCausalLM
 
@@ -344,3 +345,142 @@ def test_invalid_hard_token_configuration_is_rejected():
             assert "min <= max" in str(error)
         else:
             raise AssertionError("invalid hard-token clipping was accepted")
+
+
+def test_attention_mlp_schedule_matches_official_qwen_layer_forward():
+    torch.manual_seed(0)
+    model = LoopedQwen3ForCausalLM(
+        tiny_config(num_loops=3, loop_operator_schedule="attention_mlp")
+    ).eval()
+    reference = LoopedQwen3ForCausalLM(model.config).eval()
+    reference.load_state_dict(model.state_dict())
+
+    def official_apply(
+        self,
+        decoder_layer,
+        hidden_states,
+        attention_mask,
+        position_embeddings,
+        position_ids,
+        order,
+        **kwargs,
+    ):
+        assert order == "attention_mlp"
+        output = decoder_layer(
+            hidden_states,
+            attention_mask=attention_mask,
+            position_embeddings=position_embeddings,
+            position_ids=position_ids,
+            past_key_values=None,
+            use_cache=False,
+            **kwargs,
+        )
+        zero = torch.zeros_like(output)
+        return output, zero, zero
+
+    reference.model._apply_decoder_layer = MethodType(official_apply, reference.model)
+    x = torch.randint(0, 257, (2, 8))
+    with torch.no_grad():
+        actual = model(input_ids=x).logits
+        expected = reference(input_ids=x).logits
+    torch.testing.assert_close(actual, expected)
+
+
+def test_alternating_schedule_calls_sublayers_in_expected_order():
+    model = LoopedQwen3ForCausalLM(
+        tiny_config(num_loops=3, loop_operator_schedule="alternating_attention_mlp")
+    ).eval()
+    calls = []
+    layer = model.model.layers[0]
+    attention_handle = layer.self_attn.register_forward_pre_hook(
+        lambda _module, _inputs: calls.append("attention")
+    )
+    mlp_handle = layer.mlp.register_forward_pre_hook(
+        lambda _module, _inputs: calls.append("mlp")
+    )
+    with torch.no_grad():
+        model(input_ids=torch.randint(0, 257, (1, 8)))
+    attention_handle.remove()
+    mlp_handle.remove()
+    assert calls == [
+        "attention",
+        "mlp",
+        "mlp",
+        "attention",
+        "attention",
+        "mlp",
+    ]
+    assert model.model.last_operator_orders == (
+        "attention_mlp",
+        "mlp_attention",
+        "attention_mlp",
+    )
+
+
+def test_operator_schedules_have_identical_parameter_counts_but_different_outputs():
+    torch.manual_seed(0)
+    fixed_am = LoopedQwen3ForCausalLM(
+        tiny_config(num_loops=4, loop_operator_schedule="attention_mlp")
+    ).eval()
+    alternating = LoopedQwen3ForCausalLM(
+        tiny_config(num_loops=4, loop_operator_schedule="alternating_attention_mlp")
+    ).eval()
+    alternating.load_state_dict(fixed_am.state_dict())
+    assert sum(p.numel() for p in fixed_am.parameters()) == sum(
+        p.numel() for p in alternating.parameters()
+    )
+    x = torch.randint(0, 257, (1, 8))
+    with torch.no_grad():
+        am_logits = fixed_am(input_ids=x).logits
+        alternating_logits = alternating(input_ids=x).logits
+    assert not torch.allclose(am_logits, alternating_logits)
+
+
+def test_operator_schedule_override_is_causal_and_does_not_mutate_config():
+    torch.manual_seed(0)
+    model = LoopedQwen3ForCausalLM(
+        tiny_config(num_loops=4, loop_operator_schedule="alternating_attention_mlp")
+    ).eval()
+    x = torch.randint(0, 257, (1, 8))
+    with torch.no_grad():
+        native = model(input_ids=x).logits
+        forced_am = model(
+            input_ids=x, loop_operator_schedule="attention_mlp"
+        ).logits
+        reversed_phase = model(
+            input_ids=x, loop_operator_schedule="alternating_mlp_attention"
+        ).logits
+    assert not torch.allclose(native, forced_am)
+    assert not torch.allclose(native, reversed_phase)
+    assert model.config.loop_operator_schedule == "alternating_attention_mlp"
+
+
+def test_operator_diagnostics_are_finite_and_nonzero():
+    model = LoopedQwen3ForCausalLM(
+        tiny_config(num_loops=4, loop_operator_schedule="alternating_attention_mlp")
+    ).eval()
+    with torch.no_grad():
+        model(
+            input_ids=torch.randint(0, 257, (2, 8)),
+            return_loop_diagnostics=True,
+            return_operator_diagnostics=True,
+        )
+    diagnostic_groups = (
+        model.model.last_attention_relative_updates,
+        model.model.last_mlp_relative_updates,
+        model.model.last_operator_defects,
+        model.model.last_update_cosine_to_previous_update,
+        model.model.last_directional_diversity,
+    )
+    assert all(len(values) == 4 for values in diagnostic_groups)
+    assert all(torch.isfinite(torch.stack(values)).all() for values in diagnostic_groups)
+    assert torch.stack(model.model.last_operator_defects).min() > 0
+
+
+def test_operator_schedule_survives_hugging_face_roundtrip(tmp_path):
+    model = LoopedQwen3ForCausalLM(
+        tiny_config(loop_operator_schedule="alternating_attention_mlp")
+    )
+    model.save_pretrained(tmp_path)
+    restored = LoopedQwen3ForCausalLM.from_pretrained(tmp_path)
+    assert restored.config.loop_operator_schedule == "alternating_attention_mlp"

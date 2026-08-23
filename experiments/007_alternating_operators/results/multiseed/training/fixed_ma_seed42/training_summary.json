@@ -1,0 +1,17 @@
+{
+  "step": 304,
+  "tokens_seen": 9994240,
+  "best_val_loss": 6.91851577758789,
+  "best_val_loss_by_depth": {
+    "8": 6.917430400848389,
+    "12": 6.912515163421631,
+    "16": 6.915144443511963,
+    "20": 6.92036771774292,
+    "24": 6.927121162414551
+  },
+  "parameters": 5670402,
+  "loop_operator_schedule": "mlp_attention",
+  "loop_update_alpha_start": 0.24396498501300812,
+  "loop_update_alpha_last": 0.23364867269992828,
+  "loop_update_schedule_slope": -0.04094294458627701
+}

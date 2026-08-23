@@ -1,0 +1,65 @@
+{
+  "created_at_utc": "2026-08-23T18:51:47.639626+00:00",
+  "experiment": "007 confirmation",
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "eval_loops": [
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31,
+    32
+  ],
+  "eval_batches_per_depth": 100,
+  "selected_checkpoint_seed": 43,
+  "selected_checkpoint_criterion": "lowest dense mean PPL over depths 8..24",
+  "paired_seed_summary": [
+    {
+      "seed": 42,
+      "mean_relative_delta_percent_8_24": -10.679054402446281,
+      "fixed_ma_better_depths_4_32": 29
+    },
+    {
+      "seed": 43,
+      "mean_relative_delta_percent_8_24": -19.76266068954298,
+      "fixed_ma_better_depths_4_32": 29
+    },
+    {
+      "seed": 44,
+      "mean_relative_delta_percent_8_24": -13.705797330235946,
+      "fixed_ma_better_depths_4_32": 29
+    }
+  ],
+  "interventions": {
+    "ma_checkpoint_force_am": "completed",
+    "am_checkpoint_force_ma": "missing_checkpoint",
+    "am_checkpoint_search_note": "AM checkpoint seed 42 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d \u0432 /content; intervention AM\u2192MA \u043f\u0440\u043e\u043f\u0443\u0449\u0435\u043d. \u041e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 multiseed-\u0430\u043d\u0430\u043b\u0438\u0437 \u043e\u0441\u0442\u0430\u0451\u0442\u0441\u044f \u043f\u043e\u043b\u043d\u044b\u043c."
+  }
+}
