@@ -262,3 +262,85 @@ def test_invalid_supervision_plan_is_rejected():
             assert "sorted and unique" in str(error)
         else:
             raise AssertionError("unsorted supervision depths were accepted")
+
+
+def test_hard_token_weights_are_detached_and_prioritize_difficult_tokens():
+    previous = torch.tensor([[1.0, 4.0, 0.0]], requires_grad=True)
+    valid = torch.tensor([[True, True, False]])
+    weights = LoopedQwen3ForCausalLM._hard_token_weights(
+        previous,
+        valid,
+        gamma=0.5,
+        minimum=0.25,
+        maximum=4.0,
+    )
+    assert not weights.requires_grad
+    assert weights[0, 1] > weights[0, 0]
+    assert weights[0, 2] == 0.0
+
+
+def test_previous_loss_weighting_matches_manual_corrective_objective():
+    torch.manual_seed(0)
+    model = LoopedQwen3ForCausalLM(tiny_config(num_loops=4)).eval()
+    x = torch.randint(0, 257, (2, 8))
+    with torch.no_grad():
+        output = model(
+            input_ids=x,
+            labels=x,
+            num_loops=4,
+            supervision_loops=(1, 3, 4),
+            supervision_weights=(0.25, 0.25, 0.5),
+            token_loss_weighting="previous_loss",
+            hard_token_gamma=0.5,
+            hard_token_min_weight=0.25,
+            hard_token_max_weight=4.0,
+            hard_token_uniform_mix=0.5,
+        )
+        independent_logits = [
+            model(input_ids=x, num_loops=depth).logits for depth in (1, 3, 4)
+        ]
+
+    expected_mixed = []
+    previous_token_losses = None
+    for depth_logits in independent_logits:
+        token_losses, valid = model._causal_token_losses(depth_logits, x)
+        valid_float = valid.to(token_losses.dtype)
+        uniform = (token_losses * valid_float).sum() / valid_float.sum()
+        corrective = uniform
+        if previous_token_losses is not None:
+            hard_weights = model._hard_token_weights(
+                previous_token_losses,
+                valid,
+                gamma=0.5,
+                minimum=0.25,
+                maximum=4.0,
+            )
+            corrective = (token_losses * hard_weights).sum() / hard_weights.sum()
+        expected_mixed.append(0.5 * uniform + 0.5 * corrective)
+        previous_token_losses = token_losses
+
+    expected_mixed = torch.stack(expected_mixed)
+    torch.testing.assert_close(output.loop_losses, expected_mixed)
+    torch.testing.assert_close(
+        output.loss,
+        (expected_mixed * expected_mixed.new_tensor([0.25, 0.25, 0.5])).sum(),
+    )
+
+
+def test_invalid_hard_token_configuration_is_rejected():
+    model = LoopedQwen3ForCausalLM(tiny_config(num_loops=2))
+    x = torch.randint(0, 257, (1, 8))
+    with torch.no_grad():
+        try:
+            model(
+                input_ids=x,
+                labels=x,
+                supervision_loops=(1, 2),
+                token_loss_weighting="previous_loss",
+                hard_token_min_weight=2.0,
+                hard_token_max_weight=1.0,
+            )
+        except ValueError as error:
+            assert "min <= max" in str(error)
+        else:
+            raise AssertionError("invalid hard-token clipping was accepted")
