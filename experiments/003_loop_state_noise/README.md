@@ -116,10 +116,5 @@ python experiments/003_loop_state_noise/run.py --variant spherical_s003_r16
 python experiments/003_loop_state_noise/summarize.py
 ```
 
-Для продолжения прерванного обучения добавьте `--resume`. Для оценки готового
-checkpoint используйте `--eval-only`. Colab-процесс полностью собран в
-[`experiment_003_colab.ipynb`](experiment_003_colab.ipynb).
-
 Финальная ячейка ноутбука создаёт `experiment_003_results.zip`. Архив содержит
-JSON/CSV результатов, training logs, конфиги и сведения о runtime; веса по
-умолчанию не включаются, чтобы архив было удобно передать для анализа.
+JSON/CSV результатов, training logs, конфиги и сведения о runtime
