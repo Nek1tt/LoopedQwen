@@ -178,6 +178,9 @@ def main() -> None:
             group["lr"] = lr
         scaler.step(optimizer)
         scaler.update()
+        update_start_idx = max(model_cfg.loop_update_start_loop - 1, 0)
+        alpha_start = raw_model.model.current_loop_update_alpha(update_start_idx).detach().float().item()
+        alpha_last = raw_model.model.current_loop_update_alpha(model_cfg.num_loops - 1).detach().float().item()
         tokens_seen = (step + 1) * tokens_per_step
         elapsed = max(time.time() - started, 1e-6)
         tokens_per_second = (tokens_seen - session_start_tokens) / elapsed
@@ -187,6 +190,8 @@ def main() -> None:
             "lr": f"{lr:.2e}",
             "grad": f"{grad_norm_value:.2f}",
             "tok/s": f"{tokens_per_second:,.0f}",
+            "α2": f"{alpha_start:.3f}",
+            "αR": f"{alpha_last:.3f}",
         }
         if latest_val_loss is not None:
             postfix["val"] = f"{latest_val_loss:.4f}"
@@ -203,6 +208,8 @@ def main() -> None:
                 "step_seconds": time.time() - step_started,
                 "session_elapsed_seconds": elapsed,
                 "loop_noise_multiplier": noise_multiplier,
+                "loop_update_alpha_start": alpha_start,
+                "loop_update_alpha_last": alpha_last,
             }
             tqdm.write(json.dumps(record))
             with log_path.open("a", encoding="utf-8") as f:
@@ -244,6 +251,13 @@ def main() -> None:
                             "tokens_seen": tokens_seen,
                             "best_val_loss": best_val,
                             "parameters": parameter_count,
+                            "loop_update_alpha_start": alpha_start,
+                            "loop_update_alpha_last": alpha_last,
+                            "loop_update_schedule_slope": (
+                                raw_model.model.loop_update_log_slope.detach().float().item()
+                                if hasattr(raw_model.model, "loop_update_log_slope")
+                                else None
+                            ),
                         },
                         indent=2,
                     ),

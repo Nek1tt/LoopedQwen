@@ -84,6 +84,9 @@ def main() -> None:
             "perplexity": math.exp(min(loss, 20)),
             "elapsed_seconds": depth_elapsed,
             "batches_per_second": args.batches / max(depth_elapsed, 1e-8),
+            "loop_update_alpha_by_loop": [
+                value.cpu().item() for value in model.model.last_loop_update_alphas
+            ],
             "relative_update_by_loop": (update_sums / args.batches).cpu().tolist(),
             "hidden_norm_by_loop": (hidden_norm_sums / args.batches).cpu().tolist(),
             "cosine_to_previous_by_loop": (cosine_sums / args.batches).cpu().tolist(),
@@ -102,6 +105,14 @@ def main() -> None:
         "checkpoint": args.checkpoint,
         "loop_update_mode": cfg.loop_update_mode,
         "loop_update_alpha": alpha,
+        "loop_update_alpha_config": cfg.loop_update_alpha,
+        "loop_update_start_loop": cfg.loop_update_start_loop,
+        "loop_update_schedule_slope_config": cfg.loop_update_schedule_slope,
+        "loop_update_schedule_slope_learned": (
+            model.model.loop_update_log_slope.detach().float().item()
+            if hasattr(model.model, "loop_update_log_slope")
+            else None
+        ),
         "loop_input_dropout": cfg.loop_input_dropout,
         "loop_input_dropout_start": cfg.loop_input_dropout_start,
         "loop_noise_std": cfg.loop_noise_std,

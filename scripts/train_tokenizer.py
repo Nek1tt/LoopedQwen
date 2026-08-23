@@ -26,6 +26,11 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    print(
+        f"[tokenizer 1/3] Connecting to FineWeb ({args.dataset_config}); "
+        "the first streamed document may take 1-3 minutes...",
+        flush=True,
+    )
     dataset = load_dataset(
         "HuggingFaceFW/fineweb",
         name=args.dataset_config,
@@ -33,6 +38,11 @@ def main() -> None:
         streaming=True,
     )
 
+    print(
+        f"[tokenizer 2/3] Reading {args.documents:,} documents. "
+        "The progress bar will gain a measured ETA after the first documents arrive.",
+        flush=True,
+    )
     tokenizer = Tokenizer(models.BPE(unk_token=None))
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tokenizer.decoder = decoders.ByteLevel()
@@ -53,6 +63,7 @@ def main() -> None:
     texts = (row["text"] for row in documents)
     tokenizer.train_from_iterator(texts, trainer=trainer, length=args.documents)
 
+    print("[tokenizer 3/3] Finalizing and saving vocabulary...", flush=True)
     fast = PreTrainedTokenizerFast(
         tokenizer_object=tokenizer,
         eos_token=EOS_TOKEN,

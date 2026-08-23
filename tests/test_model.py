@@ -55,6 +55,22 @@ def test_hugging_face_roundtrip(tmp_path):
     assert len(restored.model.layers) == 2
 
 
+def test_fixed_update_alpha_survives_hugging_face_roundtrip(tmp_path):
+    model = LoopedQwen3ForCausalLM(
+        tiny_config(
+            loop_update_mode="normalized_projected",
+            loop_update_alpha=0.25,
+            loop_update_start_loop=2,
+        )
+    )
+    model.save_pretrained(tmp_path)
+    restored = LoopedQwen3ForCausalLM.from_pretrained(tmp_path)
+    torch.testing.assert_close(
+        restored.model.current_loop_update_alpha(1),
+        torch.tensor(0.25),
+    )
+
+
 def test_same_physical_layers_are_reused_each_loop():
     model = LoopedQwen3ForCausalLM(tiny_config(num_loops=3)).eval()
     calls = 0
@@ -132,3 +148,67 @@ def test_loop_noise_warmup_and_eval_determinism():
         first = model(input_ids=x).logits
         second = model(input_ids=x).logits
     torch.testing.assert_close(first, second)
+
+
+def test_normalized_projected_update_preserves_reference_rms():
+    config = tiny_config(
+        loop_update_mode="normalized_projected",
+        loop_update_alpha=0.25,
+        loop_update_start_loop=2,
+    )
+    model = LoopedQwen3ForCausalLM(config)
+    previous = torch.randn(2, 5, config.hidden_size)
+    proposal = previous + 3.0 * torch.randn_like(previous)
+    reference_rms = previous.float().square().mean(dim=-1, keepdim=True).sqrt()
+    updated, alpha = model.model._normalized_projected_update(
+        previous, proposal, reference_rms, loop_idx=1
+    )
+    updated_rms = updated.float().square().mean(dim=-1, keepdim=True).sqrt()
+    torch.testing.assert_close(updated_rms, reference_rms, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(alpha, torch.tensor(0.25))
+
+
+def test_projected_forward_locks_norm_after_first_loop():
+    model = LoopedQwen3ForCausalLM(
+        tiny_config(
+            num_loops=4,
+            loop_update_mode="normalized_projected",
+            loop_update_alpha=0.25,
+            loop_update_start_loop=2,
+        )
+    ).eval()
+    with torch.no_grad():
+        model(
+            input_ids=torch.randint(0, 257, (2, 8)),
+            return_loop_diagnostics=True,
+        )
+    norms = torch.stack(model.model.last_hidden_norms)
+    torch.testing.assert_close(norms[1:], norms[0].expand_as(norms[1:]), rtol=1e-5, atol=1e-6)
+    assert [value.item() for value in model.model.last_loop_update_alphas] == [
+        1.0,
+        0.25,
+        0.25,
+        0.25,
+    ]
+
+
+def test_learned_projected_schedule_has_gradients_and_extrapolates():
+    model = LoopedQwen3ForCausalLM(
+        tiny_config(
+            num_loops=4,
+            loop_update_mode="normalized_projected_learned",
+            loop_update_alpha=0.25,
+            loop_update_start_loop=2,
+            loop_update_schedule_slope=0.0,
+        )
+    )
+    initial = [model.model.current_loop_update_alpha(i).item() for i in (1, 3, 7)]
+    assert initial == [0.25, 0.25, 0.25]
+    model.model.loop_update_log_slope.data.fill_(0.5)
+    extrapolated = [model.model.current_loop_update_alpha(i).item() for i in (1, 3, 7)]
+    assert extrapolated[0] < extrapolated[1] < extrapolated[2]
+
+    output = model(input_ids=torch.randint(0, 257, (2, 8)), labels=torch.randint(0, 257, (2, 8)))
+    output.loss.backward()
+    assert model.model.loop_update_logit.grad is not None
+    assert model.model.loop_update_log_slope.grad is not None
