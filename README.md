@@ -1,289 +1,117 @@
-# Looped Transformer baseline on FineWeb
+# LoopedQwen: полезная рекуррентная глубина без новых параметров
 
-Minimal, inspectable baseline for the T-Lab Looped Models task. It subclasses
-the **official Hugging Face Qwen3 implementation** and reuses the **same stack
-of Qwen3 decoder layers** at
-every loop:
+Исследовательская работа для задания о циклических языковых моделях. В основе — два общих слоя Qwen3, которые многократно применяются к скрытому состоянию. Мы последовательно проверили семь гипотез: от простого управления остаточным обновлением до изменения порядка подоператоров внутри рекуррентного блока.
 
-```text
-tokens -> embedding -> [shared layer 1 -> shared layer 2] x R -> norm -> LM head
-```
+Главный результат: порядок **MLP → Attention** оказался существенно лучше стандартного **Attention → MLP** при тех же весах, числе параметров и количестве вызовов подслоёв. Эффект подтверждён на трёх парных случайных зернах и на всех 87 проверенных сочетаниях «зерно × глубина».
 
-Attention, Q/K RMSNorm, RoPE, SwiGLU, causal masking, initialization, the
-causal-LM loss and Hugging Face serialization are provided by Transformers.
-The only architectural change is the recurrent traversal of `model.layers`.
+## Лучшее решение
 
-The baseline deliberately contains no loop embeddings, intermediate losses,
-noise, early exit, or other research modifications. It is a clean control on
-top of which those ideas can be tested.
+Финальная модель сочетает:
 
-## Baseline configuration
+- два общих декодерных слоя Qwen3;
+- случайную глубину обучения от 8 до 24 итераций;
+- промежуточные языковые функции потерь на глубине 8, в средней точке и на выбранной конечной глубине;
+- нормированное проецируемое обновление скрытого состояния;
+- постоянный порядок подоператоров **MLP → Attention**;
+- 5 670 402 параметра и 9 994 240 обработанных обучающих токенов на запуск.
 
-| Item | Value |
-|---|---:|
-| Vocabulary | 16,000 byte-level BPE |
-| Hidden size | 256 |
-| Shared layers | 2 |
-| Loops | 4 |
-| Effective depth | 8 |
-| Query / KV heads | 4 / 2 |
-| SwiGLU width | 768 |
-| Context | 512 |
-| Parameters | 5,670,400 |
-| Train budget | at most 100M processed tokens |
+| Среднее по трём зернам | Attention → MLP | MLP → Attention | Изменение |
+|---|---:|---:|---:|
+| Лучший PPL | 1108,46 | **943,95** | **−14,84%** |
+| Средний PPL, глубины 8–24 | 1114,20 | **949,77** | **−14,76%** |
+| PPL на глубине 16 | 1112,72 | **947,07** | **−14,89%** |
+| PPL на глубине 32 | 1137,03 | **980,65** | **−13,75%** |
 
-The embedding and LM-head weights are tied. The training script refuses to run
-if the model exceeds 10M parameters.
+Лучший отдельный запуск — зерно 43: PPL 905,82 на глубине 11, PPL 909,87 на глубине 16 и PPL 944,76 на глубине 32.
 
-## Best result
+Открытая контрольная точка: [Nek1tt/LoopedQwen-fixed-ma-seed43](https://huggingface.co/Nek1tt/LoopedQwen-fixed-ma-seed43).
 
-The final Experiment 007 changes only the order of the two standard Qwen3
-sublayers inside every recurrent pass from Attention→MLP to MLP→Attention. It
-adds no parameters and no extra sublayer calls. Across three paired seeds it
-improves mean validation PPL over stopping depths 8–24 from 1114.20 to 949.77
-(−14.76%) and wins at all 87 evaluated seed/depth pairs.
+## Что именно было проверено
 
-| 3-seed mean | Attention→MLP | MLP→Attention |
-|---|---:|---:|
-| Best PPL | 1108.46 | **943.95** |
-| PPL@16 | 1112.72 | **947.07** |
-| PPL@24 | 1123.97 | **961.01** |
-| PPL@32 | 1137.03 | **980.65** |
+| № | Идея | Результат | Решение |
+|---:|---|---|---|
+| 001 | Общий коэффициент остаточного обновления | Снижает норму, но ухудшает PPL | Не переносить |
+| 002 | Прореживание входа повторных итераций | Улучшает глубину 8, ухудшает экстраполяцию | Не переносить |
+| 003 | Относительный и сферический шум состояния | Не улучшает качество и не устраняет сонаправленность | Не переносить |
+| 004 | Нормированное проецируемое обновление | Стабилизирует норму, но создаёт жёсткий горизонт 16 | Сохранить механизм, изменить обучение |
+| 005 | Случайная глубина и промежуточные потери | Даёт устойчивый ранний выход; эффект промежуточных потерь подтверждён на трёх зернах | Перенести |
+| 006 | Усиление трудных токенов по предыдущей ошибке | Улучшает только глубину 4, ухудшает 5–32 | Не переносить |
+| 007 | Чередование и перестановка Attention/MLP | Чередование не помогло; постоянный MLP → Attention дал лучший результат | Финальная архитектура |
 
-The best individual checkpoint is fixed-MA seed 43 with PPL 905.82 at 11
-loops. See the Experiment 007 report for the alternating-order negative result,
-causal schedule interventions and update-direction analysis.
+Полное обоснование, отрицательные результаты и аргумент о масштабировании приведены в [финальном отчёте](FINAL_REPORT.md). Исходные JSON/CSV и отдельные отчёты находятся в каталогах экспериментов.
 
-## Repository layout
-
-```text
-configs/                 experiment configurations
-src/looped_lm/modeling_looped_qwen3.py  thin Qwen3 subclass and loop
-src/looped_lm/data.py    memory-mapped token batches
-scripts/train_tokenizer.py
-scripts/prepare_data.py
-scripts/train.py
-scripts/eval.py
-scripts/upload_to_hub.py
-scripts/sanity_check.py
-experiments/             isolated experiment configs, runners and results
-experiments/003_loop_state_noise/  completed 16-loop noise experiment
-experiments/004_normalized_loop_updates/  projected-update experiment
-experiments/005_anytime_depth/  random-depth + intermediate-loss experiment
-experiments/006_hard_token_correction/  previous-error token weighting
-experiments/007_alternating_operators/  alternating Attention/MLP order
-tests/                   small CPU tests
-REPORT.md                experiment report template
-```
-
-## Experiment 003: noise between recurrent passes
-
-The third experiment trains a 16-loop control and two scale-relative Gaussian
-noise variants. Neither relative nor norm-preserving noise at `sigma=0.03`
-improved PPL at 16 loops or extrapolation to 32 loops. The hidden-state norm
-continued to grow while consecutive states became almost collinear. See
-[`experiments/003_loop_state_noise/README.md`](experiments/003_loop_state_noise/README.md)
-for the hypothesis, complete results, diagnostics and run commands.
-
-## Experiment 004: normalized projected loop updates
-
-The fourth experiment prevents recurrent residual-norm growth directly. After
-the first ordinary loop, every update is RMS-normalized, gated and projected
-back to the first loop's per-token RMS. The method keeps the norm fixed and
-preserves non-trivial updates through the trained depth, but slightly worsens
-PPL@16 and strongly overfits the exact 16-loop horizon: extrapolation to 20–32
-loops degrades. Fixed and learned gates behave similarly; the fixed gate is
-reconstructed from serialized config so Hugging Face round trips preserve it.
-See
-[`experiments/004_normalized_loop_updates/README.md`](experiments/004_normalized_loop_updates/README.md)
-for the method and experiment matrix.
-
-## Experiment 005: random depth and intermediate losses
-
-The fifth experiment trains the projected recurrent model at uniformly sampled
-depths from 8 through 24. Random depth removes the sharp 16-loop specialization
-seen in Experiment 004. Adding LM losses at loop 8, a midpoint and the sampled
-terminal depth produces the best result: PPL 1111.30 at 16 loops and 1136.32 at
-32 loops, versus 1428.02 and 1964.71 for the fixed-depth Experiment 004
-reference. Quality is stable across stopping depths but is not yet monotonic:
-PPL reaches its minimum near 12 loops and then slowly worsens. See
-[`experiments/005_anytime_depth/README.md`](experiments/005_anytime_depth/README.md)
-for the checkpoint-selection analysis and complete diagnostics.
-
-## Experiment 006: hard-token recurrent correction
-
-The sixth experiment asks whether later recurrent computation can be made more
-useful by weighting a token's later LM loss with its detached cross-entropy at
-the preceding supervised depth. The answer for the tested `gamma=0.5`, 50%
-uniform mixture is negative. Against the seed-42 uniform intermediate control,
-hard-token weighting improves only the out-of-range four-loop exit, while it is
-worse at every depth from 5 through 32. It leaves the best depth at 10, keeps
-the same 22 adjacent monotonicity violations, and increases PPL@32 regret from
-2.64% to 2.80%. See
-[`experiments/006_hard_token_correction/README.md`](experiments/006_hard_token_correction/README.md)
-for the objective, dense results, raw logs and interpretation.
-
-## Experiment 007: alternating operator recurrence
-
-The seventh experiment keeps the best random-depth/intermediate-loss setup but
-changes the recurrent operator itself. Alternating Attention→MLP and
-MLP→Attention does not improve quality and produces late update cancellation.
-The fixed MLP→Attention control instead reduces mean PPL 8–24 by 10.68–19.76%
-on each of three paired seeds and is better at every evaluated depth from 4 to
-32. Schedule interventions and non-zero order defect show that the trained
-operators are not interchangeable. See
-[`experiments/007_alternating_operators/README.md`](experiments/007_alternating_operators/README.md)
-for the full hypothesis, raw results, multiseed analysis and limitations.
-
-## Local setup
+## Быстрая проверка опубликованной модели
 
 ```bash
 git clone https://github.com/Nek1tt/LoopedQwen.git
-cd looped-transformer-baseline
+cd LoopedQwen
+python -m venv .venv
+source .venv/bin/activate
 pip install -e .
-python scripts/sanity_check.py
-pytest -q
+
+hf download Nek1tt/LoopedQwen-fixed-ma-seed43 \
+  --local-dir outputs/final/best_hf
 ```
 
-## 1. Train the tokenizer
-
-Do not use the original Qwen tokenizer: its large vocabulary makes the
-embedding table alone exceed this task's parameter limit.
-
-```bash
-python scripts/train_tokenizer.py \
-  --output-dir tokenizer \
-  --vocab-size 16000 \
-  --documents 100000
-```
-
-## 2. Prepare a fixed FineWeb subset
-
-This command streams FineWeb and writes disjoint packed token streams. It does
-not download the full dataset.
-
-```bash
-python scripts/prepare_data.py \
-  --tokenizer tokenizer \
-  --output-dir data \
-  --train-tokens 100000000 \
-  --val-tokens 1000000
-```
-
-`data/metadata.json` records the tokenizer, split and exact token counts.
-Training consumes non-overlapping contexts sequentially, so the 99,975,168
-processed tokens are unique within the prepared 100M-token stream. The global
-batch index determines the offset, making resume deterministic.
-
-## 3. Smoke test before spending GPU time
-
-```bash
-python scripts/train.py --config configs/smoke.yaml
-```
-
-The smoke configuration uses 1M processed tokens and a smaller CPU-friendly
-model. For a quicker data test, prepare at least 1.1M train tokens first.
-
-## 4. Train the baseline
-
-```bash
-python scripts/train.py --config configs/baseline.yaml
-```
-
-The output directory contains:
-
-- `best_hf/`: best checkpoint in Hugging Face `save_pretrained()` format;
-- `last_state.pt`: resumable optimizer and model state;
-- `metrics.jsonl`: training and validation metrics;
-- `run_config.json`: exact run configuration.
-
-Resume an interrupted Colab session after restoring the output directory:
-
-```bash
-python scripts/train.py \
-  --config configs/baseline.yaml \
-  --resume outputs/baseline/last_state.pt
-```
-
-## 5. Evaluate whether later loops remain useful
+Файл `val.bin` не хранится ни в Git, ни в модельном репозитории из-за размера. Для проверки на новом потоке его нужно подготовить заново. Точное совпадение с опубликованными числами требует исходного бинарного потока; сами исходные метрики и их хеши сохранены на Hugging Face. После подготовки:
 
 ```bash
 python scripts/eval.py \
-  --checkpoint outputs/baseline/best_hf \
+  --checkpoint outputs/final/best_hf \
   --val-file data/val.bin \
-  --loops 1 2 4 8 16 \
+  --loops 4 8 11 12 16 24 32 \
+  --batches 100 \
+  --output outputs/final/eval.json
+```
+
+Точные варианты проверки, подготовка данных и повторное обучение описаны в [инструкции воспроизводимости](REPRODUCIBILITY.md).
+
+## Обучение лучшей конфигурации
+
+После подготовки `tokenizer/`, `data/train.bin` и `data/val.bin`:
+
+```bash
+python scripts/train.py \
+  --config experiments/007_alternating_operators/configs/fixed_ma_seed43.yaml
+```
+
+Плотная оценка:
+
+```bash
+python scripts/eval.py \
+  --checkpoint outputs/experiments/007_multiseed/fixed_ma_seed43/best_hf \
+  --val-file data/val.bin \
+  --loops 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 \
   --batches 100
 ```
 
-The evaluator uses identical validation batches for every loop count and
-reports loss, perplexity and
+## Проверка кода и результатов
+
+```bash
+python scripts/sanity_check.py
+python scripts/verify_results.py
+pytest -q
+```
+
+`verify_results.py` не требует GPU: он проверяет читаемость всех JSON/CSV, полноту плотных оценок, ключевые опубликованные значения и парность многосидового сравнения.
+
+## Структура репозитория
 
 ```text
-||h_(r+1) - h_r|| / ||h_r||
+configs/                 базовые конфигурации
+src/looped_lm/           модель и загрузчик бинарных токенов
+scripts/                 обучение, оценка, подготовка данных и проверки
+experiments/001...007/   гипотезы, код, конфигурации и результаты
+FINAL_REPORT.md          итоговый исследовательский отчёт
+REPRODUCIBILITY.md       полная инструкция воспроизводимости
+tests/                   быстрые тесты на центральном процессоре
 ```
 
-for each loop. This is the first diagnostic for saturation or convergence.
+В репозитории намеренно нет весов, токенизатора, бинарных данных и блокнотов Colab. Веса и токенизатор опубликованы на Hugging Face; в Git остаются только код, конфигурации и проверяемые результаты.
 
-## First experiment matrix
+## Честные ограничения
 
-Copy `configs/baseline.yaml` and change only `model.num_loops`:
-
-| Run | Train loops | Eval loops |
-|---|---:|---|
-| control | 1 | 1, 2, 4, 8 |
-| loop-2 | 2 | 1, 2, 4, 8 |
-| loop-4 | 4 | 1, 2, 4, 8, 16 |
-| loop-8 | 8 | 1, 2, 4, 8, 16 |
-
-Keep the tokenizer, data files, seed and processed-token budget fixed. Report
-parameter count and loop-dependent FLOPs separately: sharing weights reduces
-parameters, not computation.
-
-## Push to GitHub
-
-```bash
-git init
-git add .
-git commit -m "Add looped Transformer FineWeb baseline"
-git branch -M main
-git remote add origin https://github.com/YOUR_NAME/YOUR_REPOSITORY.git
-git push -u origin main
-```
-
-Data, tokenizers and checkpoints are intentionally ignored by Git. Upload the
-best checkpoint and tokenizer to a public Hugging Face model repository when
-the experiment is complete:
-
-```bash
-hf auth login
-python scripts/upload_to_hub.py \
-  --checkpoint outputs/baseline/best_hf \
-  --repo-id YOUR_NAME/looped-qwen3-baseline
-```
-
-The uploaded checkpoint includes the custom loop wrapper and can be loaded in
-a clean environment:
-
-```python
-from transformers import AutoModelForCausalLM
-
-model = AutoModelForCausalLM.from_pretrained(
-    "YOUR_NAME/looped-qwen3-baseline",
-    trust_remote_code=True,
-)
-```
-
-## Notes and current limitations
-
-- This is a single-GPU baseline intended for Colab, not a distributed trainer.
-- The repository pins Transformers 5.15.1 because the subclass follows that
-  official Qwen3 API. Upgrade only together with the compatibility tests.
-- KV caching is intentionally disabled. A normal Qwen3 cache has one slot per
-  physical layer and is not correct for repeated effective-depth positions.
-- Validation contexts are sampled from one fixed, document-disjoint token file.
-- Training contexts traverse the shuffled-document stream sequentially. The
-  budget counts tokens actually passed to the model.
-- Evaluation beyond the trained loop count is intentional but is not guaranteed
-  to improve perplexity.
-- The default is `float16` for compatibility with common Colab T4 GPUs. On
-  Ampere or newer GPUs, `bfloat16` is also available and usually preferable.
+- Сравнение MLP → Attention с Attention → MLP подтверждено на трёх зернах, но только при текущем размере модели и бюджете данных.
+- Случайная глубина против фиксированной многосидово не повторялась; на трёх зернах проверен дополнительный эффект промежуточных функций потерь.
+- Лучший метод улучшает всю кривую качества, но не делает каждую следующую итерацию полезной: средний минимум находится около глубины 12, а затем PPL медленно растёт.
+- Точная побитовая репликация обучения требует того же подготовленного токенизированного потока. Публичная контрольная точка позволяет воспроизвести итоговую оценку без повторного обучения.
