@@ -81,3 +81,54 @@ def test_hf_causal_loss_shifts_labels_once():
             x[:, 1:].contiguous().view(-1),
         )
     torch.testing.assert_close(output.loss, expected)
+
+
+def test_fixed_loop_update_is_applied():
+    torch.manual_seed(0)
+    full = LoopedQwen3ForCausalLM(tiny_config(num_loops=1)).eval()
+    fixed = LoopedQwen3ForCausalLM(
+        tiny_config(num_loops=1, loop_update_mode="fixed", loop_update_alpha=0.0)
+    ).eval()
+    fixed.load_state_dict(full.state_dict(), strict=False)
+    x = torch.randint(0, 257, (1, 8))
+    with torch.no_grad():
+        fixed_hidden = fixed.model(input_ids=x).last_hidden_state
+        embedded = fixed.model.norm(fixed.model.embed_tokens(x))
+    torch.testing.assert_close(fixed_hidden, embedded)
+
+
+def test_loop_input_dropout_is_training_only():
+    model = LoopedQwen3ForCausalLM(
+        tiny_config(loop_input_dropout=0.2, loop_input_dropout_start=2)
+    )
+    x = torch.randint(0, 257, (1, 8))
+    model.eval()
+    with torch.no_grad():
+        first = model(input_ids=x).logits
+        second = model(input_ids=x).logits
+    torch.testing.assert_close(first, second)
+
+
+def test_norm_preserving_loop_noise_preserves_token_rms():
+    config = tiny_config(loop_noise_std=0.1, loop_noise_mode="norm_preserving")
+    model = LoopedQwen3ForCausalLM(config)
+    states = torch.randn(2, 5, config.hidden_size)
+    before = states.float().square().mean(dim=-1).sqrt()
+    after = model.model._add_loop_noise(states)
+    after_rms = after.float().square().mean(dim=-1).sqrt()
+    torch.testing.assert_close(after_rms, before, rtol=1e-5, atol=1e-6)
+    assert not torch.allclose(after, states)
+
+
+def test_loop_noise_warmup_and_eval_determinism():
+    model = LoopedQwen3ForCausalLM(
+        tiny_config(loop_noise_std=0.05, loop_noise_warmup_steps=10)
+    )
+    assert model.set_loop_noise_step(0) == 0.1
+    assert model.set_loop_noise_step(20) == 1.0
+    x = torch.randint(0, 257, (1, 8))
+    model.eval()
+    with torch.no_grad():
+        first = model(input_ids=x).logits
+        second = model(input_ids=x).logits
+    torch.testing.assert_close(first, second)

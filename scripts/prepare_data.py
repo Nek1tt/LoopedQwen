@@ -22,7 +22,13 @@ def parse_args() -> argparse.Namespace:
 def write_exact_tokens(dataset, tokenizer, path: Path, target: int, progress_name: str) -> int:
     written = 0
     eos = tokenizer.eos_token_id
-    progress = tqdm(total=target, unit="tok", desc=progress_name)
+    progress = tqdm(
+        total=target,
+        unit="tok",
+        unit_scale=True,
+        desc=progress_name,
+        dynamic_ncols=True,
+    )
     with path.open("wb") as f:
         for row in dataset:
             ids = tokenizer.encode(row["text"], add_special_tokens=False)

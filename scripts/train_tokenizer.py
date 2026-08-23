@@ -5,6 +5,7 @@ from pathlib import Path
 
 from datasets import load_dataset
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+from tqdm.auto import tqdm
 from transformers import PreTrainedTokenizerFast
 
 
@@ -42,7 +43,14 @@ def main() -> None:
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
         show_progress=True,
     )
-    texts = (row["text"] for row in islice(dataset, args.documents))
+    documents = tqdm(
+        islice(dataset, args.documents),
+        total=args.documents,
+        desc="FineWeb tokenizer documents",
+        unit="doc",
+        dynamic_ncols=True,
+    )
+    texts = (row["text"] for row in documents)
     tokenizer.train_from_iterator(texts, trainer=trainer, length=args.documents)
 
     fast = PreTrainedTokenizerFast(
@@ -58,4 +66,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
