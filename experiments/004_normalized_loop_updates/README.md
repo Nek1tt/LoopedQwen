@@ -14,24 +14,23 @@ Experiment 004 воздействует не на состояние после 
 токена. Начиная со второго loop, общий Qwen3-блок формирует proposal `F(h_l)` и
 обновление
 
-\[
+$$
 \Delta_l = F(h_l)-h_l.
-\]
+$$
 
 Его RMS приводится к масштабу первого прохода, после чего применяется gate:
 
-\[
+$$
 \widehat\Delta_l = \Delta_l\frac{r}{\operatorname{RMS}(\Delta_l)+\varepsilon},
-\qquad
-\widetilde h_{l+1}=h_l+\alpha_l\widehat\Delta_l.
-\]
+\qquad \widetilde h_{l+1}=h_l+\alpha_l\widehat\Delta_l.
+$$
 
 Наконец состояние проецируется обратно на RMS-сферу первого прохода:
 
-\[
+$$
 h_{l+1}=\widetilde h_{l+1}
 \frac{r}{\operatorname{RMS}(\widetilde h_{l+1})+\varepsilon}.
-\]
+$$
 
 Проекция запрещает модели получать ложное уменьшение relative update только за
 счёт роста residual norm. Радиальная часть proposal становится бесполезной, и
@@ -51,9 +50,9 @@ seed 42 и 9,994,240 фактически обработанных токено�
 
 В learned-варианте
 
-\[
+$$
 \alpha_l=\sigma\left(b+s\log(l/2)\right),
-\]
+$$
 
 где `b` инициализируется так, чтобы `α_2=0.25`, а `s=0`. Такая
 параметризация задаёт гладкий schedule, требует только два скаляра и имеет
