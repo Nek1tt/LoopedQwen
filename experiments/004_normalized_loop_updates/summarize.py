@@ -17,7 +17,6 @@ VARIANT_ORDER = {
 }
 FIELDNAMES = (
     "variant",
-    "metric_source",
     "loop_update_mode",
     "loop_update_alpha_config",
     "loop_update_start_loop",
@@ -51,7 +50,6 @@ def load_rows(path: Path) -> list[dict[str, object]]:
         rows.append(
             {
                 "variant": variant,
-                "metric_source": "evaluation",
                 "loop_update_mode": payload.get("loop_update_mode", "full"),
                 "loop_update_alpha_config": payload.get("loop_update_alpha_config"),
                 "loop_update_start_loop": payload.get("loop_update_start_loop"),
@@ -68,25 +66,6 @@ def load_rows(path: Path) -> list[dict[str, object]]:
     return rows
 
 
-def load_training_validation(path: Path) -> dict[str, object]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    return {
-        "variant": payload["variant"],
-        "metric_source": "training_validation",
-        "loop_update_mode": payload["loop_update_mode"],
-        "loop_update_alpha_config": payload["loop_update_alpha_config"],
-        "loop_update_start_loop": payload["loop_update_start_loop"],
-        "learned_schedule_slope": payload.get("learned_schedule_slope"),
-        "eval_loops": payload["loops"],
-        "loss": payload["loss"],
-        "perplexity": payload["perplexity"],
-        "last_loop_update_alpha": payload.get("last_loop_update_alpha"),
-        "last_hidden_norm": None,
-        "last_relative_update": None,
-        "last_cosine_to_previous": None,
-    }
-
-
 def main() -> None:
     args = parse_args()
     results_dir = args.results_dir.expanduser().resolve()
@@ -94,10 +73,6 @@ def main() -> None:
     if not paths:
         raise FileNotFoundError(f"No *_eval.json files found in {results_dir}")
     rows = [row for path in paths for row in load_rows(path)]
-    rows.extend(
-        load_training_validation(path)
-        for path in results_dir.glob("*_train_validation.json")
-    )
     rows.sort(
         key=lambda row: (
             VARIANT_ORDER.get(str(row["variant"]), len(VARIANT_ORDER)),
@@ -108,7 +83,7 @@ def main() -> None:
     output = (args.output or results_dir / "summary.csv").expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=FIELDNAMES)
+        writer = csv.DictWriter(file, fieldnames=FIELDNAMES, lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
     print(f"Wrote {len(rows)} rows to {output}")

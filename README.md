@@ -70,8 +70,8 @@ the first ordinary loop, every update is RMS-normalized, gated and projected
 back to the first loop's per-token RMS. The method keeps the norm fixed and
 preserves non-trivial updates through the trained depth, but slightly worsens
 PPL@16 and strongly overfits the exact 16-loop horizon: extrapolation to 20–32
-loops degrades. A fixed-gate checkpoint also exposed and motivated a fix for a
-non-persistent-buffer serialization bug.
+loops degrades. Fixed and learned gates behave similarly; the fixed gate is
+reconstructed from serialized config so Hugging Face round trips preserve it.
 See
 [`experiments/004_normalized_loop_updates/README.md`](experiments/004_normalized_loop_updates/README.md)
 for the method and experiment matrix. The Colab notebook runs training and
