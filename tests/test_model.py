@@ -212,3 +212,53 @@ def test_learned_projected_schedule_has_gradients_and_extrapolates():
     output.loss.backward()
     assert model.model.loop_update_logit.grad is not None
     assert model.model.loop_update_log_slope.grad is not None
+
+
+def test_intermediate_lm_losses_match_independent_depths():
+    torch.manual_seed(0)
+    model = LoopedQwen3ForCausalLM(tiny_config(num_loops=4)).eval()
+    x = torch.randint(0, 257, (2, 8))
+    with torch.no_grad():
+        anytime = model(
+            input_ids=x,
+            labels=x,
+            num_loops=4,
+            supervision_loops=(1, 3, 4),
+            supervision_weights=(0.25, 0.25, 0.5),
+        )
+        independent = torch.stack(
+            [model(input_ids=x, labels=x, num_loops=depth).loss for depth in (1, 3, 4)]
+        )
+    torch.testing.assert_close(anytime.loop_losses, independent)
+    torch.testing.assert_close(
+        anytime.loss,
+        (independent * independent.new_tensor([0.25, 0.25, 0.5])).sum(),
+    )
+    assert anytime.supervised_loops == (1, 3, 4)
+
+
+def test_intermediate_losses_backpropagate_to_shared_layers():
+    model = LoopedQwen3ForCausalLM(tiny_config(num_loops=4))
+    x = torch.randint(0, 257, (2, 8))
+    output = model(
+        input_ids=x,
+        labels=x,
+        num_loops=4,
+        supervision_loops=(1, 2, 4),
+        supervision_weights=(0.25, 0.25, 0.5),
+    )
+    output.loss.backward()
+    assert output.loop_losses.shape == (3,)
+    assert model.model.layers[0].self_attn.q_proj.weight.grad is not None
+
+
+def test_invalid_supervision_plan_is_rejected():
+    model = LoopedQwen3ForCausalLM(tiny_config(num_loops=4))
+    x = torch.randint(0, 257, (1, 8))
+    with torch.no_grad():
+        try:
+            model(input_ids=x, labels=x, num_loops=4, supervision_loops=(3, 2, 4))
+        except ValueError as error:
+            assert "sorted and unique" in str(error)
+        else:
+            raise AssertionError("unsorted supervision depths were accepted")

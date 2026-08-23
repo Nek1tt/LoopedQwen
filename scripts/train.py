@@ -2,6 +2,7 @@
 import argparse
 import json
 import math
+import random
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -32,26 +33,80 @@ def estimate_loss(
     amp_context,
     seed=1234,
     description="validation",
-) -> float:
+    loop_depths=None,
+) -> tuple[float, dict[int, float]]:
     model.eval()
-    generator = torch.Generator().manual_seed(seed)
-    losses = []
+    depths = tuple(loop_depths or (model.config.num_loops,))
+    if any(depth < 1 for depth in depths):
+        raise ValueError("validation loop depths must be positive")
+    losses_by_depth = {}
     progress = tqdm(
-        range(batches),
+        total=batches * sum(depths),
         desc=description,
-        unit="batch",
+        unit="loop-batch",
         leave=False,
         dynamic_ncols=True,
     )
-    for _ in progress:
-        x, _ = dataset.get_batch(batch_size, device, generator)
-        with amp_context():
-            # Hugging Face's causal-LM loss performs the one-token shift.
-            loss = model(input_ids=x, labels=x, use_cache=False).loss
-        losses.append(loss.float())
-        progress.set_postfix(loss=f"{torch.stack(losses).mean().item():.4f}")
+    for depth in depths:
+        # Reusing the seed makes every depth see exactly the same validation batches.
+        generator = torch.Generator().manual_seed(seed)
+        losses = []
+        for batch_idx in range(batches):
+            x, _ = dataset.get_batch(batch_size, device, generator)
+            with amp_context():
+                # Hugging Face's causal-LM loss performs the one-token shift.
+                loss = model(
+                    input_ids=x,
+                    labels=x,
+                    use_cache=False,
+                    num_loops=depth,
+                ).loss
+            losses.append(loss.float())
+            running = torch.stack(losses).mean().item()
+            progress.update(depth)
+            progress.set_postfix(
+                R=depth,
+                batch=f"{batch_idx + 1}/{batches}",
+                loss=f"{running:.4f}",
+            )
+        losses_by_depth[depth] = torch.stack(losses).mean().item()
+        tqdm.write(f"validation R={depth}: loss={losses_by_depth[depth]:.4f}")
+    progress.close()
     model.train()
-    return torch.stack(losses).mean().item()
+    mean_loss = sum(losses_by_depth.values()) / len(losses_by_depth)
+    return mean_loss, losses_by_depth
+
+
+def depth_plan(training: dict, default_depth: int, seed: int, batch_index: int):
+    """Return a deterministic compute depth, supervised depths and loss weights."""
+    mode = training.get("depth_sampling", "fixed")
+    if mode == "fixed":
+        depth = default_depth
+    elif mode == "uniform":
+        minimum = int(training["min_train_loops"])
+        maximum = int(training["max_train_loops"])
+        # A local RNG makes the schedule independent of dropout/data RNG and resume-safe.
+        depth = random.Random(seed + 1_000_003 * batch_index).randint(minimum, maximum)
+    else:
+        raise ValueError("training.depth_sampling must be fixed or uniform")
+
+    if not training.get("intermediate_lm_losses", False):
+        return depth, (depth,), (1.0,)
+
+    base = int(training.get("intermediate_loss_base_loop", training["min_train_loops"]))
+    if base > depth:
+        raise ValueError("intermediate_loss_base_loop cannot exceed sampled depth")
+    midpoint = (base + depth) // 2
+    supervised = tuple(sorted({base, midpoint, depth}))
+    if len(supervised) == 1:
+        weights = (1.0,)
+    else:
+        final_weight = float(training.get("final_loss_weight", 0.5))
+        auxiliary_weight = (1.0 - final_weight) / (len(supervised) - 1)
+        weights = tuple(
+            final_weight if loop == depth else auxiliary_weight for loop in supervised
+        )
+    return depth, supervised, weights
 
 
 def save_resume_state(path, model, optimizer, step, tokens_seen, best_val, config) -> None:
@@ -116,6 +171,20 @@ def main() -> None:
         raise ValueError("max_train_tokens is smaller than one optimizer step")
     start_step, tokens_seen, best_val = 0, 0, float("inf")
 
+    validation_loops = tuple(train_cfg.get("validation_loops", [model_cfg.num_loops]))
+    if not validation_loops or any(depth < 1 for depth in validation_loops):
+        raise ValueError("training.validation_loops must contain positive depths")
+    if train_cfg.get("depth_sampling", "fixed") == "uniform":
+        minimum = int(train_cfg["min_train_loops"])
+        maximum = int(train_cfg["max_train_loops"])
+        if not 1 <= minimum <= maximum:
+            raise ValueError("Require 1 <= min_train_loops <= max_train_loops")
+        if maximum > model_cfg.num_loops:
+            raise ValueError("max_train_loops cannot exceed model.num_loops")
+    final_loss_weight = float(train_cfg.get("final_loss_weight", 0.5))
+    if not 0.0 < final_loss_weight <= 1.0:
+        raise ValueError("training.final_loss_weight must be in (0, 1]")
+
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model"])
@@ -135,8 +204,12 @@ def main() -> None:
     print(
         f"training plan: steps={total_steps:,}; start={start_step:,}; "
         f"tokens/step={tokens_per_step:,}; total_tokens={total_steps * tokens_per_step:,}; "
-        f"effective_depth={model_cfg.num_hidden_layers * model_cfg.num_loops}; "
-        f"eval_every={train_cfg['eval_interval']} steps x {train_cfg['eval_batches']} batches",
+        f"depth_sampling={train_cfg.get('depth_sampling', 'fixed')}; "
+        f"train_depth={train_cfg.get('min_train_loops', model_cfg.num_loops)}–"
+        f"{train_cfg.get('max_train_loops', model_cfg.num_loops)}; "
+        f"intermediate_losses={train_cfg.get('intermediate_lm_losses', False)}; "
+        f"validation_depths={list(validation_loops)}; "
+        f"eval_every={train_cfg['eval_interval']} steps x {train_cfg['eval_batches']} batches/depth",
         flush=True,
     )
     progress = tqdm(
@@ -154,16 +227,36 @@ def main() -> None:
         noise_multiplier = raw_model.set_loop_noise_step(step)
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
+        sampled_depths = []
+        component_loss_sums = {}
+        component_loss_counts = {}
+        last_supervised = ()
         for micro_step in range(train_cfg["gradient_accumulation_steps"]):
             batch_index = step * train_cfg["gradient_accumulation_steps"] + micro_step
+            sampled_depth, supervised_loops, supervision_weights = depth_plan(
+                train_cfg, model_cfg.num_loops, config["seed"], batch_index
+            )
+            sampled_depths.append(sampled_depth)
+            last_supervised = supervised_loops
             x = train_data.get_sequential_batch(
                 train_cfg["micro_batch_size"], batch_index, device
             )
             with amp_context():
-                loss = model(input_ids=x, labels=x, use_cache=False).loss
+                output = model(
+                    input_ids=x,
+                    labels=x,
+                    use_cache=False,
+                    num_loops=sampled_depth,
+                    supervision_loops=supervised_loops,
+                    supervision_weights=supervision_weights,
+                )
+                loss = output.loss
                 loss = loss / train_cfg["gradient_accumulation_steps"]
             scaler.scale(loss).backward()
             accumulated_loss += loss.detach().float().item()
+            for loop, component in zip(supervised_loops, output.loop_losses):
+                component_loss_sums[loop] = component_loss_sums.get(loop, 0.0) + component.detach().float().item()
+                component_loss_counts[loop] = component_loss_counts.get(loop, 0) + 1
 
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_cfg["grad_clip"])
@@ -180,7 +273,7 @@ def main() -> None:
         scaler.update()
         update_start_idx = max(model_cfg.loop_update_start_loop - 1, 0)
         alpha_start = raw_model.model.current_loop_update_alpha(update_start_idx).detach().float().item()
-        alpha_last = raw_model.model.current_loop_update_alpha(model_cfg.num_loops - 1).detach().float().item()
+        alpha_last = raw_model.model.current_loop_update_alpha(sampled_depths[-1] - 1).detach().float().item()
         tokens_seen = (step + 1) * tokens_per_step
         elapsed = max(time.time() - started, 1e-6)
         tokens_per_second = (tokens_seen - session_start_tokens) / elapsed
@@ -190,6 +283,8 @@ def main() -> None:
             "lr": f"{lr:.2e}",
             "grad": f"{grad_norm_value:.2f}",
             "tok/s": f"{tokens_per_second:,.0f}",
+            "Rμ": f"{sum(sampled_depths) / len(sampled_depths):.1f}",
+            "heads": "/".join(map(str, last_supervised)),
             "α2": f"{alpha_start:.3f}",
             "αR": f"{alpha_last:.3f}",
         }
@@ -210,6 +305,12 @@ def main() -> None:
                 "loop_noise_multiplier": noise_multiplier,
                 "loop_update_alpha_start": alpha_start,
                 "loop_update_alpha_last": alpha_last,
+                "sampled_depths": sampled_depths,
+                "mean_sampled_depth": sum(sampled_depths) / len(sampled_depths),
+                "component_losses": {
+                    str(loop): component_loss_sums[loop] / component_loss_counts[loop]
+                    for loop in sorted(component_loss_sums)
+                },
             }
             tqdm.write(json.dumps(record))
             with log_path.open("a", encoding="utf-8") as f:
@@ -217,7 +318,7 @@ def main() -> None:
 
         should_eval = step % train_cfg["eval_interval"] == 0 or step == total_steps - 1
         if should_eval:
-            val_loss = estimate_loss(
+            val_loss, val_losses_by_depth = estimate_loss(
                 model,
                 val_data,
                 train_cfg["eval_batches"],
@@ -225,6 +326,7 @@ def main() -> None:
                 device,
                 amp_context,
                 description=f"validation step {step + 1}/{total_steps}",
+                loop_depths=validation_loops,
             )
             latest_val_loss = val_loss
             progress.set_postfix({**postfix, "val": f"{val_loss:.4f}"})
@@ -233,6 +335,9 @@ def main() -> None:
                 "tokens_seen": tokens_seen,
                 "val_loss": val_loss,
                 "val_perplexity": math.exp(min(val_loss, 20)),
+                "val_loss_by_depth": {
+                    str(depth): loss for depth, loss in val_losses_by_depth.items()
+                },
                 "session_elapsed_seconds": time.time() - started,
             }
             tqdm.write(json.dumps(record))
@@ -250,6 +355,10 @@ def main() -> None:
                             "step": step,
                             "tokens_seen": tokens_seen,
                             "best_val_loss": best_val,
+                            "best_val_loss_by_depth": {
+                                str(depth): loss
+                                for depth, loss in val_losses_by_depth.items()
+                            },
                             "parameters": parameter_count,
                             "loop_update_alpha_start": alpha_start,
                             "loop_update_alpha_last": alpha_last,
