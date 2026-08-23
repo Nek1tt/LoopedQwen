@@ -5,6 +5,7 @@ applied repeatedly. Attention, Q/K normalization, RoPE, MLP, masks, loss,
 initialization and PreTrainedModel integration come from Transformers.
 """
 
+import math
 from typing import Any
 
 import torch
@@ -27,6 +28,9 @@ class LoopedQwen3Config(Qwen3Config):
         num_loops: int = 4,
         loop_update_mode: str = "full",
         loop_update_alpha: float = 1.0,
+        loop_update_start_loop: int = 2,
+        loop_update_schedule_slope: float = 0.0,
+        loop_update_norm_eps: float = 1.0e-6,
         loop_input_dropout: float = 0.0,
         loop_input_dropout_start: int = 2,
         loop_noise_std: float = 0.0,
@@ -39,6 +43,9 @@ class LoopedQwen3Config(Qwen3Config):
         self.num_loops = num_loops
         self.loop_update_mode = loop_update_mode
         self.loop_update_alpha = loop_update_alpha
+        self.loop_update_start_loop = loop_update_start_loop
+        self.loop_update_schedule_slope = loop_update_schedule_slope
+        self.loop_update_norm_eps = loop_update_norm_eps
         self.loop_input_dropout = loop_input_dropout
         self.loop_input_dropout_start = loop_input_dropout_start
         self.loop_noise_std = loop_noise_std
@@ -49,8 +56,26 @@ class LoopedQwen3Config(Qwen3Config):
         super().__init__(**kwargs)
         if self.num_loops < 1:
             raise ValueError("num_loops must be positive")
-        if self.loop_update_mode not in {"full", "fixed", "learned_shared"}:
-            raise ValueError("loop_update_mode must be full, fixed, or learned_shared")
+        valid_update_modes = {
+            "full",
+            "fixed",
+            "learned_shared",
+            "normalized_projected",
+            "normalized_projected_learned",
+        }
+        if self.loop_update_mode not in valid_update_modes:
+            raise ValueError(
+                "loop_update_mode must be one of " + ", ".join(sorted(valid_update_modes))
+            )
+        if self.loop_update_start_loop < 1:
+            raise ValueError("loop_update_start_loop must be positive")
+        if self.loop_update_norm_eps <= 0.0:
+            raise ValueError("loop_update_norm_eps must be positive")
+        if self.loop_update_mode.startswith("normalized_projected"):
+            if self.loop_update_start_loop < 2:
+                raise ValueError("normalized projected updates must start at loop 2 or later")
+            if not 0.0 < self.loop_update_alpha < 1.0:
+                raise ValueError("normalized projected loop_update_alpha must be in (0, 1)")
         if not 0.0 <= self.loop_input_dropout < 1.0:
             raise ValueError("loop_input_dropout must be in [0, 1)")
         if self.loop_input_dropout_start < 1:
@@ -85,10 +110,18 @@ class LoopedQwen3Model(Qwen3Model):
                 torch.tensor(float(config.loop_update_alpha)),
                 persistent=False,
             )
+        if config.loop_update_mode == "normalized_projected_learned":
+            initial_alpha = float(config.loop_update_alpha)
+            initial_logit = math.log(initial_alpha / (1.0 - initial_alpha))
+            self.loop_update_logit = torch.nn.Parameter(torch.tensor(initial_logit))
+            self.loop_update_log_slope = torch.nn.Parameter(
+                torch.tensor(float(config.loop_update_schedule_slope))
+            )
         self.register_buffer("_loop_noise_multiplier", torch.ones(()), persistent=False)
         self.last_relative_updates: tuple[torch.Tensor, ...] = ()
         self.last_hidden_norms: tuple[torch.Tensor, ...] = ()
         self.last_cosine_to_previous: tuple[torch.Tensor, ...] = ()
+        self.last_loop_update_alphas: tuple[torch.Tensor, ...] = ()
 
     def set_loop_noise_step(self, step: int) -> float:
         """Set the noise warmup multiplier for an optimizer step."""
@@ -97,10 +130,44 @@ class LoopedQwen3Model(Qwen3Model):
         self._loop_noise_multiplier.fill_(multiplier)
         return multiplier
 
-    def current_loop_update_alpha(self) -> torch.Tensor:
+    def current_loop_update_alpha(self, loop_idx: int | None = None) -> torch.Tensor:
         if self.config.loop_update_mode == "full":
-            return self.loop_update_alpha.new_ones(())
+            return self.embed_tokens.weight.new_ones(())
+        if self.config.loop_update_mode in {"fixed", "normalized_projected"}:
+            # Non-persistent buffers may be left uninitialized by Transformers'
+            # low-memory from_pretrained path. Fixed gates are configuration,
+            # not learned state, so reconstruct them from the serialized config.
+            return self.embed_tokens.weight.new_tensor(float(self.config.loop_update_alpha))
+        if self.config.loop_update_mode == "normalized_projected_learned":
+            if loop_idx is None:
+                loop_idx = self.config.num_loops - 1
+            loop_number = loop_idx + 1
+            relative_loop = max(loop_number / self.config.loop_update_start_loop, 1.0)
+            schedule_position = self.loop_update_logit.new_tensor(math.log(relative_loop))
+            return torch.sigmoid(
+                self.loop_update_logit + self.loop_update_log_slope * schedule_position
+            )
         return self.loop_update_alpha
+
+    def _normalized_projected_update(
+        self,
+        previous: torch.Tensor,
+        proposal: torch.Tensor,
+        reference_rms: torch.Tensor,
+        loop_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Take a normalized step and return each token to the reference RMS sphere."""
+        original_dtype = proposal.dtype
+        previous_float = previous.float()
+        delta = proposal.float() - previous_float
+        eps = self.config.loop_update_norm_eps
+        delta_rms = delta.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(eps)
+        normalized_delta = delta * (reference_rms / delta_rms)
+        alpha = self.current_loop_update_alpha(loop_idx).float()
+        candidate = previous_float + alpha * normalized_delta
+        candidate_rms = candidate.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(eps)
+        projected = candidate * (reference_rms / candidate_rms)
+        return projected.to(original_dtype), alpha
 
     def _add_loop_noise(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Add scale-relative noise; optionally keep each token on its RMS sphere."""
@@ -174,6 +241,8 @@ class LoopedQwen3Model(Qwen3Model):
         relative_updates = []
         hidden_norms = []
         cosine_to_previous = []
+        loop_update_alphas = []
+        reference_rms = None
 
         for loop_idx in range(loops):
             previous = hidden_states
@@ -198,8 +267,28 @@ class LoopedQwen3Model(Qwen3Model):
                     **kwargs,
                 )
 
-            alpha = self.current_loop_update_alpha().to(hidden_states.dtype)
-            hidden_states = previous + alpha * (hidden_states - previous)
+            if self.config.loop_update_mode.startswith("normalized_projected"):
+                loop_number = loop_idx + 1
+                if loop_number < self.config.loop_update_start_loop:
+                    alpha = hidden_states.new_ones(())
+                    if loop_number == self.config.loop_update_start_loop - 1:
+                        reference_rms = (
+                            hidden_states.float()
+                            .square()
+                            .mean(dim=-1, keepdim=True)
+                            .sqrt()
+                            .clamp_min(self.config.loop_update_norm_eps)
+                            .detach()
+                        )
+                else:
+                    if reference_rms is None:
+                        raise RuntimeError("Missing reference RMS for normalized loop update")
+                    hidden_states, alpha = self._normalized_projected_update(
+                        previous, hidden_states, reference_rms, loop_idx
+                    )
+            else:
+                alpha = self.current_loop_update_alpha(loop_idx).to(hidden_states.dtype)
+                hidden_states = previous + alpha * (hidden_states - previous)
 
             if return_loop_diagnostics:
                 numerator = (hidden_states.float() - previous.float()).norm(dim=-1).mean()
@@ -210,6 +299,7 @@ class LoopedQwen3Model(Qwen3Model):
                     hidden_states.float(), previous.float(), dim=-1
                 ).mean()
                 cosine_to_previous.append(cosine.detach())
+                loop_update_alphas.append(alpha.detach().float())
 
             should_add_noise = (
                 self.training
@@ -223,6 +313,7 @@ class LoopedQwen3Model(Qwen3Model):
         self.last_relative_updates = tuple(relative_updates)
         self.last_hidden_norms = tuple(hidden_norms)
         self.last_cosine_to_previous = tuple(cosine_to_previous)
+        self.last_loop_update_alphas = tuple(loop_update_alphas)
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=None)
 

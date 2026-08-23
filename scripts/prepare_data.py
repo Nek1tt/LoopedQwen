@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 from datasets import load_dataset
-from tqdm import tqdm
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 
@@ -51,12 +51,18 @@ def main() -> None:
     if args.train_tokens <= 0 or args.val_tokens <= 0:
         raise ValueError("Token counts must be positive")
 
+    print(f"[data 1/3] Loading tokenizer from {args.tokenizer}...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     if len(tokenizer) >= 65536:
         raise ValueError("This data format uses uint16; tokenizer vocab must be below 65,536")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    print(
+        f"[data 2/3] Connecting to FineWeb ({args.dataset_config}); "
+        "the first streamed document may take 1-3 minutes...",
+        flush=True,
+    )
     dataset = load_dataset(
         "HuggingFaceFW/fineweb",
         name=args.dataset_config,
@@ -67,6 +73,11 @@ def main() -> None:
     # Split the stream by documents before packing. Validation is fixed and disjoint.
     val_stream = dataset.take(20_000)
     train_stream = dataset.skip(20_000)
+    print(
+        f"[data 3/3] Packing {args.val_tokens:,} validation and "
+        f"{args.train_tokens:,} training tokens...",
+        flush=True,
+    )
     val_written = write_exact_tokens(
         val_stream, tokenizer, output_dir / "val.bin", args.val_tokens, "validation"
     )

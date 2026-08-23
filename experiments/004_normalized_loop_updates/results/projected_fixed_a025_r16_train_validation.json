@@ -1,0 +1,14 @@
+{
+  "variant": "projected_fixed_a025_r16",
+  "metric_source": "training_validation",
+  "step": 304,
+  "tokens_seen": 9994240,
+  "loops": 16,
+  "loss": 7.266695976257324,
+  "perplexity": 1431.8118887074818,
+  "loop_update_mode": "normalized_projected",
+  "loop_update_alpha_config": 0.25,
+  "loop_update_start_loop": 2,
+  "last_loop_update_alpha": 0.25,
+  "note": "Valid in-memory training-time validation. The archived multi-depth evaluation is invalid because the fixed-alpha buffer was not restored correctly by from_pretrained."
+}

@@ -48,7 +48,8 @@ scripts/eval.py
 scripts/upload_to_hub.py
 scripts/sanity_check.py
 experiments/             isolated experiment configs, runners and results
-experiments/003_loop_state_noise/  16-loop noise experiment and Colab notebook
+experiments/003_loop_state_noise/  completed 16-loop noise experiment
+experiments/004_normalized_loop_updates/  projected-update experiment + Colab
 tests/                   small CPU tests
 REPORT.md                experiment report template
 ```
@@ -60,9 +61,22 @@ noise variants. Neither relative nor norm-preserving noise at `sigma=0.03`
 improved PPL at 16 loops or extrapolation to 32 loops. The hidden-state norm
 continued to grow while consecutive states became almost collinear. See
 [`experiments/003_loop_state_noise/README.md`](experiments/003_loop_state_noise/README.md)
-for the hypothesis, complete results, diagnostics and run commands. A complete
-ZIP-in / results-ZIP-out Colab workflow is provided in
-[`experiment_003_colab.ipynb`](experiments/003_loop_state_noise/experiment_003_colab.ipynb).
+for the hypothesis, complete results, diagnostics and run commands.
+
+## Experiment 004: normalized projected loop updates
+
+The fourth experiment prevents recurrent residual-norm growth directly. After
+the first ordinary loop, every update is RMS-normalized, gated and projected
+back to the first loop's per-token RMS. The method keeps the norm fixed and
+preserves non-trivial updates through the trained depth, but slightly worsens
+PPL@16 and strongly overfits the exact 16-loop horizon: extrapolation to 20–32
+loops degrades. A fixed-gate checkpoint also exposed and motivated a fix for a
+non-persistent-buffer serialization bug.
+See
+[`experiments/004_normalized_loop_updates/README.md`](experiments/004_normalized_loop_updates/README.md)
+for the method and experiment matrix. The Colab notebook runs training and
+evaluation inside the active Jupyter kernel so progress and ETA remain visible
+in the notebook cells.
 
 ## Local setup
 
