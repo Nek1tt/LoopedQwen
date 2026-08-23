@@ -6,6 +6,7 @@ initialization and PreTrainedModel integration come from Transformers.
 """
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -18,6 +19,14 @@ from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Model,
     Qwen3PreTrainedModel,
 )
+
+
+@dataclass
+class LoopedCausalLMOutputWithPast(CausalLMOutputWithPast):
+    """Causal-LM output with the per-depth losses used by anytime training."""
+
+    loop_losses: torch.FloatTensor | None = None
+    supervised_loops: tuple[int, ...] | None = None
 
 
 class LoopedQwen3Config(Qwen3Config):
@@ -122,6 +131,8 @@ class LoopedQwen3Model(Qwen3Model):
         self.last_hidden_norms: tuple[torch.Tensor, ...] = ()
         self.last_cosine_to_previous: tuple[torch.Tensor, ...] = ()
         self.last_loop_update_alphas: tuple[torch.Tensor, ...] = ()
+        self.last_captured_hidden_states: tuple[torch.Tensor, ...] = ()
+        self.last_captured_loops: tuple[int, ...] = ()
 
     def set_loop_noise_step(self, step: int) -> float:
         """Set the noise warmup multiplier for an optimizer step."""
@@ -202,6 +213,7 @@ class LoopedQwen3Model(Qwen3Model):
         use_cache: bool | None = None,
         num_loops: int | None = None,
         return_loop_diagnostics: bool = False,
+        capture_hidden_at_loops: tuple[int, ...] | list[int] | None = None,
         **kwargs: Any,
     ) -> BaseModelOutputWithPast:
         if (input_ids is None) == (inputs_embeds is None):
@@ -217,6 +229,12 @@ class LoopedQwen3Model(Qwen3Model):
         loops = self.config.num_loops if num_loops is None else num_loops
         if loops < 1:
             raise ValueError("num_loops must be positive")
+        capture_loops = tuple(capture_hidden_at_loops or ())
+        if capture_loops != tuple(sorted(set(capture_loops))):
+            raise ValueError("capture_hidden_at_loops must be sorted and unique")
+        if any(loop < 1 or loop > loops for loop in capture_loops):
+            raise ValueError("captured loop depths must be between 1 and num_loops")
+        capture_set = set(capture_loops)
         if position_ids is None:
             position_ids = torch.arange(
                 inputs_embeds.shape[1], device=inputs_embeds.device
@@ -242,6 +260,7 @@ class LoopedQwen3Model(Qwen3Model):
         hidden_norms = []
         cosine_to_previous = []
         loop_update_alphas = []
+        captured_hidden_states = []
         reference_rms = None
 
         for loop_idx in range(loops):
@@ -301,6 +320,11 @@ class LoopedQwen3Model(Qwen3Model):
                 cosine_to_previous.append(cosine.detach())
                 loop_update_alphas.append(alpha.detach().float())
 
+            # Capture before optional between-loop noise. This is exactly the
+            # state that would be decoded if computation stopped at this depth.
+            if loop_idx + 1 in capture_set:
+                captured_hidden_states.append(hidden_states)
+
             should_add_noise = (
                 self.training
                 and self.config.loop_noise_std > 0.0
@@ -314,6 +338,8 @@ class LoopedQwen3Model(Qwen3Model):
         self.last_hidden_norms = tuple(hidden_norms)
         self.last_cosine_to_previous = tuple(cosine_to_previous)
         self.last_loop_update_alphas = tuple(loop_update_alphas)
+        self.last_captured_hidden_states = tuple(captured_hidden_states)
+        self.last_captured_loops = capture_loops
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(last_hidden_state=hidden_states, past_key_values=None)
 
@@ -347,10 +373,21 @@ class LoopedQwen3ForCausalLM(Qwen3ForCausalLM):
         logits_to_keep: int | torch.Tensor = 0,
         num_loops: int | None = None,
         return_loop_diagnostics: bool = False,
+        supervision_loops: tuple[int, ...] | list[int] | None = None,
+        supervision_weights: tuple[float, ...] | list[float] | None = None,
         **kwargs: Any,
-    ) -> CausalLMOutputWithPast:
+    ) -> LoopedCausalLMOutputWithPast:
         # This mirrors the thin official Qwen3ForCausalLM wrapper. Custom loop
         # arguments are consumed here instead of leaking into the HF loss.
+        loops = self.config.num_loops if num_loops is None else num_loops
+        supervised_loops = tuple(supervision_loops or ())
+        if supervised_loops and labels is None:
+            raise ValueError("labels are required when supervision_loops are provided")
+        if supervised_loops != tuple(sorted(set(supervised_loops))):
+            raise ValueError("supervision_loops must be sorted and unique")
+        if any(loop < 1 or loop > loops for loop in supervised_loops):
+            raise ValueError("supervision depths must be between 1 and num_loops")
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -360,20 +397,59 @@ class LoopedQwen3ForCausalLM(Qwen3ForCausalLM):
             use_cache=use_cache,
             num_loops=num_loops,
             return_loop_diagnostics=return_loop_diagnostics,
+            capture_hidden_at_loops=[loop for loop in supervised_loops if loop != loops],
             **kwargs,
         )
         hidden_states = outputs.last_hidden_state
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
-        if labels is not None:
+        loop_losses = None
+        if labels is not None and supervised_loops:
+            if supervision_weights is None:
+                weights = logits.new_full((len(supervised_loops),), 1.0 / len(supervised_loops))
+            else:
+                if len(supervision_weights) != len(supervised_loops):
+                    raise ValueError("supervision_weights must match supervision_loops")
+                weights = logits.new_tensor(supervision_weights)
+                if torch.any(weights < 0) or weights.sum() <= 0:
+                    raise ValueError("supervision_weights must be non-negative with a positive sum")
+                weights = weights / weights.sum()
+
+            captured = dict(
+                zip(self.model.last_captured_loops, self.model.last_captured_hidden_states)
+            )
+            losses = []
+            for loop in supervised_loops:
+                if loop == loops:
+                    depth_logits = logits
+                else:
+                    depth_hidden = self.model.norm(captured[loop])
+                    depth_logits = self.lm_head(depth_hidden[:, slice_indices, :])
+                losses.append(
+                    self.loss_function(
+                        logits=depth_logits,
+                        labels=labels,
+                        vocab_size=self.config.vocab_size,
+                        **kwargs,
+                    )
+                )
+            loop_losses = torch.stack(losses)
+            loss = (loop_losses * weights).sum()
+        elif labels is not None:
             loss = self.loss_function(
                 logits=logits,
                 labels=labels,
                 vocab_size=self.config.vocab_size,
                 **kwargs,
             )
-        return CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=None)
+        return LoopedCausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=None,
+            loop_losses=loop_losses,
+            supervised_loops=supervised_loops or None,
+        )
 
 
 # Local AutoClass support and portable save_pretrained() code packaging.

@@ -49,7 +49,8 @@ scripts/upload_to_hub.py
 scripts/sanity_check.py
 experiments/             isolated experiment configs, runners and results
 experiments/003_loop_state_noise/  completed 16-loop noise experiment
-experiments/004_normalized_loop_updates/  projected-update experiment + Colab
+experiments/004_normalized_loop_updates/  projected-update experiment
+experiments/005_anytime_depth/  random-depth + intermediate-loss experiment
 tests/                   small CPU tests
 REPORT.md                experiment report template
 ```
@@ -74,9 +75,19 @@ loops degrades. Fixed and learned gates behave similarly; the fixed gate is
 reconstructed from serialized config so Hugging Face round trips preserve it.
 See
 [`experiments/004_normalized_loop_updates/README.md`](experiments/004_normalized_loop_updates/README.md)
-for the method and experiment matrix. The Colab notebook runs training and
-evaluation inside the active Jupyter kernel so progress and ETA remain visible
-in the notebook cells.
+for the method and experiment matrix.
+
+## Experiment 005: random depth and intermediate losses
+
+The fifth experiment trains the projected recurrent model at uniformly sampled
+depths from 8 through 24. Random depth removes the sharp 16-loop specialization
+seen in Experiment 004. Adding LM losses at loop 8, a midpoint and the sampled
+terminal depth produces the best result: PPL 1111.30 at 16 loops and 1136.32 at
+32 loops, versus 1428.02 and 1964.71 for the fixed-depth Experiment 004
+reference. Quality is stable across stopping depths but is not yet monotonic:
+PPL reaches its minimum near 12 loops and then slowly worsens. See
+[`experiments/005_anytime_depth/README.md`](experiments/005_anytime_depth/README.md)
+for the checkpoint-selection analysis and complete diagnostics.
 
 ## Local setup
 
