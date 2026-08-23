@@ -158,14 +158,3 @@ python experiments/004_normalized_loop_updates/run.py \
   --variant projected_learned_a025_r16 --resume
 python experiments/004_normalized_loop_updates/summarize.py
 ```
-
-Colab workflow находится в
-[`experiment_004_colab.ipynb`](experiment_004_colab.ipynb). В нём runner
-запускается с `--in-process`: `train.py` и `eval.py` выполняются внутри текущего
-Jupyter kernel, поэтому notebook-native progress, ETA, validation bars и логи
-видны непосредственно в ячейках. Каждый вариант вынесен в отдельную ячейку,
-которую можно безопасно повторить с resume.
-
-Финальная ячейка создаёт `experiment_004_results.zip` с JSON/CSV, конфигами,
-training logs и runtime information. Checkpoint weights по умолчанию не входят
-в архив.
