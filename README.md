@@ -56,11 +56,11 @@ REPORT.md                experiment report template
 ## Experiment 003: noise between recurrent passes
 
 The third experiment trains a 16-loop control and two scale-relative Gaussian
-noise variants. The main variant perturbs hidden-state direction while
-preserving each token's RMS, which isolates exploration from recurrent norm
-growth. See
+noise variants. Neither relative nor norm-preserving noise at `sigma=0.03`
+improved PPL at 16 loops or extrapolation to 32 loops. The hidden-state norm
+continued to grow while consecutive states became almost collinear. See
 [`experiments/003_loop_state_noise/README.md`](experiments/003_loop_state_noise/README.md)
-for the hypothesis, ablations, run commands and analysis protocol. A complete
+for the hypothesis, complete results, diagnostics and run commands. A complete
 ZIP-in / results-ZIP-out Colab workflow is provided in
 [`experiment_003_colab.ipynb`](experiments/003_loop_state_noise/experiment_003_colab.ipynb).
 
