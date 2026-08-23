@@ -222,6 +222,7 @@ def main() -> None:
         f"{train_cfg.get('max_train_loops', model_cfg.num_loops)}; "
         f"intermediate_losses={train_cfg.get('intermediate_lm_losses', False)}; "
         f"token_weighting={token_loss_weighting}; "
+        f"operator_schedule={model_cfg.loop_operator_schedule}; "
         f"validation_depths={list(validation_loops)}; "
         f"eval_every={train_cfg['eval_interval']} steps x {train_cfg['eval_batches']} batches/depth",
         flush=True,
@@ -337,6 +338,7 @@ def main() -> None:
                 "loop_noise_multiplier": noise_multiplier,
                 "loop_update_alpha_start": alpha_start,
                 "loop_update_alpha_last": alpha_last,
+                "loop_operator_schedule": model_cfg.loop_operator_schedule,
                 "sampled_depths": sampled_depths,
                 "mean_sampled_depth": sum(sampled_depths) / len(sampled_depths),
                 "component_losses": {
@@ -407,6 +409,7 @@ def main() -> None:
                                 for depth, loss in val_losses_by_depth.items()
                             },
                             "parameters": parameter_count,
+                            "loop_operator_schedule": model_cfg.loop_operator_schedule,
                             "loop_update_alpha_start": alpha_start,
                             "loop_update_alpha_last": alpha_last,
                             "loop_update_schedule_slope": (
