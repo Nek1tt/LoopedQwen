@@ -40,7 +40,7 @@ python experiments/001_skip_connections/run.py --variant fixed_05_r8
 python experiments/001_skip_connections/run.py --variant learned_shared_r8
 ```
 
-Для продолжения прерванного обучения добавьте `--resume`. Только оценка существующей контрольной точки запускается с `--eval-only`.
+Для продолжения прерванного обучения добавьте `--resume`. Только оценка существующего checkpoint запускается с `--eval-only`.
 
 После получения трёх JSON соберите итоговую таблицу:
 
